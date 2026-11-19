@@ -4,12 +4,14 @@
 
 ## 1. Получите файлы
 
-Войдите в GitHub под аккаунтом, у которого есть доступ к репозиторию. Скачайте файл `minecraft-mod-curator-0.7.0-plugin.zip` со страницы [выпуска 0.7.0](https://github.com/IKirillka/modpack-builder/releases/tag/v0.7.0), распакуйте его и откройте терминал в папке `minecraft-mod-curator`. Для сборки из исходников используйте Git.
+Войдите в GitHub под аккаунтом, у которого есть доступ к репозиторию. Скачайте файл `minecraft-mod-curator-0.7.0-plugin.zip` со страницы [выпуска 0.7.0](https://github.com/IKirillka/modpack-builder/releases/tag/v0.7.0), распакуйте его и откройте терминал в папке `minecraft-mod-curator`. Если Git уже настроен для доступа к этому приватному репозиторию, можно установить плагин из исходников.
 
 ```bash
 git clone https://github.com/IKirillka/modpack-builder.git
 cd modpack-builder
 ```
+
+Если используете GitHub CLI, выполните `gh auth login`, а затем `gh repo clone IKirillka/modpack-builder` и `cd modpack-builder`.
 
 ## 2. Установите локальный компонент
 
@@ -36,7 +38,7 @@ codex plugin add minecraft-mod-curator@minecraft-mod-tools-local
 
 Откройте новый локальный чат Codex и проверьте, что **Modpack Builder** доступен. Команда `codex plugin marketplace list` показывает зарегистрированные каталоги. При обновлении существующей установки используйте её каталог и переустановите плагин по тому же ID. [Документация OpenAI по каталогам плагинов](https://developers.openai.com/plugins/build/plugins).
 
-Если в вашей версии Codex есть локальный MCP, но отсутствует команда `codex plugin`, вместо регистрации плагина подключите сервер напрямую и передайте инструкции из `skills/curate-minecraft-mods/SKILL.md` в проект, где будете им пользоваться.
+Если в вашей версии Codex есть локальный MCP, но отсутствует команда `codex plugin`, подключите сервер напрямую. В новом чате попросите Codex прочитать `skills/curate-minecraft-mods/SKILL.md` из папки плагина.
 
 ```bash
 codex mcp add minecraft_mod_curator -- python3 "$PWD/scripts/launch.py" serve --transport stdio
