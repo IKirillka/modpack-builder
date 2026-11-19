@@ -1,0 +1,12 @@
+{
+  "name": "minecraft-mod-tools-local",
+  "interface": {"displayName": "Minecraft Mod Tools (local)"},
+  "plugins": [
+    {
+      "name": "minecraft-mod-curator",
+      "source": {"source": "local", "path": "./"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+      "category": "Productivity"
+    }
+  ]
+}

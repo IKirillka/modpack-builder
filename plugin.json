@@ -1,0 +1,30 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "minecraft-mod-curator",
+  "version": "0.7.0",
+  "description": "Persistent CurseForge curation and complete file/dependency manifests for Prism Launcher",
+  "license": "MIT",
+  "keywords": [
+    "minecraft",
+    "curseforge",
+    "mods",
+    "local-downloads"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Modpack Builder",
+        "shortDescription": "Build and export CurseForge packs for Prism",
+        "longDescription": "Code traverses the real catalogue and resolves exact file dependencies. The current agent reviews descriptions; confirmed sets export as CurseForge ZIP for Prism Launcher. Local JAR downloading is supplemental.",
+        "category": "Productivity",
+        "capabilities": [
+          "Read",
+          "Write"
+        ],
+        "defaultPrompt": [
+          "Подбери моды CurseForge под мою версию Minecraft, загрузчик и пожелания."
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+vendor/
+.env
+*.sqlite3*
+browser-profile/
+
+# Local captures, reports and historical one-machine notes.
+/evidence/*
+!/evidence/plugin.schema.json
+!/evidence/mcp.schema.json
+/docs/*
+!/docs/INSTALL.md
+!/docs/JOB_CLEANUP.md
+!/docs/MCP.md
+*.log
+*.sqlite
+*.sqlite-*
+.env.*
+
+/.codex/config.toml

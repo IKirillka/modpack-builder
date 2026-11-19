@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minecraft-mod-curator"
+version = "0.7.0"
+description = "Persistent CurseForge catalogue curation and local MCP downloads"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.26,<2", "httpx>=0.28,<1", "beautifulsoup4>=4.13,<5", "playwright>=1.56,<2", "filelock>=3.20,<4", "packaging>=24.2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=1", "jsonschema>=4", "build>=1"]
+
+[project.scripts]
+mod-curator = "mod_curator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mod_curator = ["instructions.md", "server_instructions.md"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

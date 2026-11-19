@@ -1,0 +1,79 @@
+# MCP-функции v0.2
+
+Входные структуры проверяются Pydantic; все ID проектов — числовые CurseForge project ID. Все долгие сетевые операции выполняет отдельный процесс, а не обработчик MCP-вызова. База SQLite переживает отключение агента. У каждого процесса lock; после аварии `resume_job` восстанавливает работу с сохранённой страницы.
+
+| Функция | Действие |
+|---|---|
+| `capabilities()` | Настроенные локальные папки, транспорт, наличие ключа, границы версии |
+| `start_collection(filters)` | Создать задачу, немедленно вернуть `job_id`, запустить код сбора/описаний |
+| `job_status(job_id)` | Стадия, следующая страница, обработанные/собранные/описанные/проанализированные проекты, ошибки, worker, замеры |
+| `list_jobs()` | Найти ранее сохранённые задачи после перезапуска |
+| `job_results(job_id, offset=0, limit=50)` | Структурированные проекты в исходном порядке; явная пагинация |
+| `cancel_job(job_id)` | Флаг отмены; состояние сохранено, проверять статус до остановки |
+| `resume_job(job_id)` | Продолжить ошибку/отмену/аварию; после ошибки описаний повторяются только отсутствующие |
+| `analysis_batch(job_id, offset=0, limit=5)` | Полные описания ещё не оценённых проектов и пожелания; максимум 20 проектов в одном ответе |
+| `project_details(job_id, project_id)` | Повторно прочитать полное описание и старое решение для пересмотра |
+| `analysis_overview(job_id, offset=0, limit=50)` | Прочитать сохранённые решения для общего анализа пересечений функций |
+| `save_analysis(job_id, decisions, requirements_revision)` | Сохранить решения ИИ с хешами описаний; отклонить устаревшие данные |
+| `propose_selection(job_id, project_ids, overlap_review, expected_revision)` | Список2/список3: только после анализа всех проектов и общего обзора |
+| `revise_selection(job_id, project_ids, expected_revision, wishes?, note?)` | Код вычисляет added/removed/unchanged, историю; новые ID получают метаданные/описания фоново |
+| `get_selection(job_id)` | Названия, ссылки, решения, ревизия, fingerprint для подтверждения |
+| `confirm_and_export(job_id, revision, selection_fingerprint, pack_name?, loader_version?)` | Основной финал: полный CurseForge manifest/ZIP для Prism; при нерешённых связях draft |
+| `confirm_and_install(job_id, revision, selection_fingerprint)` | Дополнительный прежний путь: после подтверждения скачать JAR самостоятельно |
+| `installation_report(job_id)` | Lock точных файлов, результаты скачивания/хешей, JAR-проверка, ручные ссылки, история |
+
+`Filters`: `minecraft`, `loader` (Forge/Fabric/NeoForge/Quilt), `categories` (slug), `excluded_categories`, `search`, `minimum_downloads >= 0`, `wishes`, `destination` (локально зарегистрированный alias), `page_size` (10/20/50), `allow_prerelease` (по умолчанию false). Неизвестные параметры отвергаются. Исключения категорий представлены в схеме, но их UI-проверка экспериментальна и закрывается ошибкой, если контроль сайта не распознан. Не считать такой фильтр гарантированно поддержанным. Загрузчик/категории/search требуют узнаваемых выбранных элементов сайта, одного наличия параметра URL недостаточно.
+
+`Decision`: `project_id`, `evidence_sha256` (из `description_sha256`), `functions`, `fit`, `include`, `explanation`, `uncertainties` (список строк). Результаты сохраняет текущая модель; инструмент не делает скрытых вызовов LLM.
+
+После `save_analysis` список ожидающих решений сокращается: следующий `analysis_batch` берите с `offset=0`. Если описание слишком велико для окна клиента, уменьшите limit до 1. Если даже одно описание не помещается, сообщите ограничение клиента; не сохраняйте решение по обрезанному тексту. Деление одного описания по частям пока не реализовано.
+
+Типичные состояния: `queued` → `running/collect` → `running/describe` → `awaiting_analysis` → `awaiting_confirmation` → `running/install` → `completed` либо `partial`. Ошибки и отмена имеют состояния `error` и `cancelled`; ошибки в массиве являются историей попыток, актуальный исход смотрите в `status`. `reason`: `threshold`, `catalog_end`, `cancelled`, `error`; успешная причина сбора дополнительно сохраняется как `collection_reason`.
+
+`observed_catalog_scanned` означает, что просмотрена вся наблюдавшаяся выдача и число уникальных карточек совпало с заявленным. `uncertain_catalog_scanned` означает, что при обходе были признаки сдвигов, нарушений порядка или неполноты. Старые задания с `observed_sorted_prefix` сохраняют исторический статус. Динамическая выдача не гарантирует замороженный снимок.
+
+Аннотации `readOnlyHint` выставлены для чтения. Изменяющие состояние функции отмечены write, включая выдачу порции анализа, которая сохраняет начало замера. Ни shell-команд, ни произвольного HTTP-fetch, ни произвольных путей файлов через MCP нет.
+
+Для установки `job_status` также возвращает `activity` с текущим действием/ID файла, `files_total` и `files_finished`. `agent_analysis_wall` измеряет время от выдачи первой порции до предложения списка, включая простои и MCP-обмен; это не чистое время вычисления модели. Программные стадии измеряются монотонными часами и суммируются по попыткам.
+
+Prism-экспорт использует фоновую стадию `export`, исходы `exported`/`draft`, данные `pack_export` в `installation_report`. `exported` означает готовность ZIP к импорту, а не установку. Сайт читается через локальный CDP без обязательного API key; обязательные связи извлекаются со страницы конкретного файла `/dependencies`, не из пустого mainFile.relatedProjects. Всего 17 инструментов: сохранены прежние 16 и добавлен необходимый confirm_and_export.
+
+
+## Проверка после импорта (0.2.1)
+
+`installation_report` возвращает `collection_audit`, `prism_import_verification` и `prism_import_complete`. Проверка импорта записывается локальной CLI-командой `verify prism JOB --instance PATH [--log LOG]`; она читает только явно указанный экземпляр и не запускает Minecraft. Проверка страниц — `verify collection JOB`, по сохранённому HTML/SQLite. Эти команды не являются новыми MCP-инструментами, агент не получает произвольный доступ к файлам.
+
+`ready_for_prism_import` означает готовый manifest, `prism_import_complete=true` — проверенный импорт, `runtime_tested=false` — игра не запускалась. Старое `installation_complete` относится к дополнительному собственному JAR-загрузчику и может оставаться false после успешного Prism-импорта.
+
+
+## Частичные описания (0.2.2)
+
+`job_status`: `catalogue` отдельно от `description_completeness`, `descriptions_available`, `unresolved_descriptions`/`unresolved_errors` и `analyzed`. Исторический `errors` остаётся журналом; текущие проблемы перечислены отдельно. `analysis_complete_for_available` не равен `analysis_complete_for_entire_set`.
+
+`analysis_batch` возвращает `remaining` только для доступных полных описаний, `insufficient_data` со ссылками/причинами и `analysis_scope`. Полные тексты не обрезаются. Из metadata исключены несмысловые массивы аватаров и файлов; оригинал остаётся в SQLite. `propose_selection` требует решений по всем доступным описаниям, отдельно сообщает deferred-проекты. Недоступный проект нельзя включить без настоящего анализа и хеша описания.
+
+
+## Извлечение фактов (0.3.0)
+
+Четыре новых конкретных интерфейса; произвольных команд/путей MCP не принимает.
+
+- `extraction_queue(job_id, action, ...)`: prepare (только очередь/кэш), progress, claim (до 25/50k), renew, submit, release. Действующий batch_id принадлежит заданию; максимум 2 аренды в базе, TTL 900 s. submit валидирует ID/схему/цитаты, сохраняет хорошие и повторяет только ошибочные; модель из provenance не считается проверенной без локальной session metadata.
+- `fact_records(job_id, offset, limit, review_only, full)`: основной Sol читает факты/сводки, не исходные описания. full добавляет evidence; требования/ограничения сохраняются и в кратком ответе.
+- `save_fact_selection(job_id, records, requirements_revision)`: список {project_id, decision: matches/excludes/uncertain, reason}; отдельная версионная таблица, исходные факты сохраняются. Недостаточная информация требует uncertain.
+- `start_fact_extraction(job_id, max_batches=1, effort=medium)`: немедленно возвращает ID/PID фонового изолированного Codex CLI-worker; только явное количество порций, никакого автоматического запуска всего набора.
+
+`job_status(..., since=cursor, details=false)` возвращает changed=false при отсутствии изменений, без прежнего большого тела; details=true явно запрашивает историю. Для извлечения прогресс читается через extraction_queue progress, так как очередь не меняет JSON старого задания. Опрос не чаще подсказки poll_after_seconds. `project_details(..., include_description=false)` по умолчанию не передаёт текст/metadata; true — точечная проверка. Старые решения и инструменты остаются, но массовый анализ через analysis_batch не является основным режимом.
+
+
+## Бюджет и добор в 0.5.0
+
+- `analysis_status(job_id, preview=true)` показывает ожидаемый объём без вызова модели. С `run_id` возвращает состояние запуска и фактические счётчики.
+- `analysis_settings(job_id?, settings?, reset=false)` меняет режим и отдельные настройки. Без job_id задаёт общие настройки. Изменения действуют на новые запуски.
+- `analysis_run(action, job_id?, run_id?, batches?)` запускает, останавливает новые назначения или возобновляет порции в пределах прежнего бюджета. Бюджет общий для воркеров и повторов.
+- `review_candidates` возвращает подсказки для сравнения по сохранённым кратким сведениям. Их рассматривает Sol, а автоматических правок списков нет.
+- `extend_collection(job_id, minimum_downloads, expected_revision)` создаёт добор с теми же фильтрами и меньшим порогом. Возвращает связанный ID.
+- `save_fact_selection` принимает необязательный список `criteria` с именами полей ТЗ, например `preferences.decor`. Через `analysis_overview(recheck_only=true)` можно читать только решения, помеченные для переоценки.
+
+## Модели воркеров в 0.5.1
+
+`analysis_status` возвращает `agent_roles` с задачами, моделью и глубиной каждой роли, `model_options` и `observed_workers` для запуска. `analysis_settings(settings={model, effort, retry_model, retry_effort})` принимает настройки первого прохода и повторов. Для `retry_model` и `retry_effort` значение `inherit` восстанавливает наследование. Параллельные воркеры выполняют роли по мере выдачи очереди. Модель текущего чата выбирается в клиенте Codex.

@@ -1,0 +1,16 @@
+{
+  "name": "minecraft-mod-curator",
+  "version": "0.7.0",
+  "description": "Persistent CurseForge curation and complete file/dependency manifests for Prism Launcher",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Modpack Builder",
+    "shortDescription": "Build and export CurseForge packs for Prism",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ]
+  }
+}

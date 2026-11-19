@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "minecraft_mod_curator": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["${PLUGIN_ROOT}/scripts/launch.py", "serve", "--transport", "stdio"]
+    }
+  }
+}

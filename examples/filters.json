@@ -1,0 +1,12 @@
+{
+  "minecraft": "1.21.1",
+  "loader": "NeoForge",
+  "categories": [
+    "create"
+  ],
+  "minimum_downloads": 27000000,
+  "wishes": "Заводы на вращательной силе Create, автоматизация кухни и логистика. Без боевых модов и лишних декоративных дублей.",
+  "destination": "packs",
+  "page_size": 10,
+  "allow_prerelease": false
+}
