@@ -17,23 +17,28 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 root = Path(__file__).resolve().parents[1]
-version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-trial = Path(tempfile.mkdtemp(prefix="mod-curator-package-smoke-"))
+version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+trial = Path(tempfile.mkdtemp(prefix="mod curator тест-")).resolve()
 with zipfile.ZipFile(root / f"dist/minecraft-mod-curator-{version}-plugin.zip") as z:
     z.extractall(trial)
 plugin = trial / "minecraft-mod-curator"
-env = {**os.environ, "MOD_CURATOR_HOME": str(trial / "state"), "MOD_CURATOR_SKIP_AGENTS": "1"}
+env = {**os.environ, "MOD_CURATOR_HOME": str(trial / "state"), "MOD_CURATOR_SKIP_AGENTS": "1",
+       "MOD_CURATOR_RUNTIME": str(trial / "state/runtime")}
 begin = time.monotonic()
 with (trial / "install.log").open("w") as log:
-    subprocess.run(["bash", str(plugin / "scripts/install.sh")], env=env, stdout=log, stderr=log, check=True)
+    subprocess.run([sys.executable, "-X", "utf8", str(plugin / "scripts/install.py")], env=env, stdout=log, stderr=log, check=True)
 subprocess.run([sys.executable, str(plugin / "scripts/launch.py"), "init", "--destination", str(trial / "mods"), "--alias", "smoke"],
                env=env, stdout=subprocess.DEVNULL, check=True)
 install_seconds = time.monotonic() - begin
+command, args, settings = sys.executable, [str(plugin / "scripts/launch.py"), "serve"], env
+if sys.platform == "win32":
+    market_mcp = trial / "state/windows-marketplace/.mcp.json"
+    server = json.loads(market_mcp.read_text(encoding="utf-8"))["mcpServers"]["minecraft_mod_curator"]
+    command, args, settings = server["command"], server["args"], {**env, **server.get("env", {})}
 
 
 async def check():
-    async with stdio_client(StdioServerParameters(command=sys.executable,
-            args=[str(plugin / "scripts/launch.py"), "serve"], env=env)) as (r, w):
+    async with stdio_client(StdioServerParameters(command=command, args=args, env=settings)) as (r, w):
         async with ClientSession(r, w) as s:
             init = await s.initialize()
             tools = await s.list_tools()
@@ -41,15 +46,29 @@ async def check():
             assert cap["destinations"]["smoke"] == str(trial / "mods")
             assert cap["version"] == version
             assert cap["display_name"] == init.serverInfo.name == "Modpack Builder"
-            assert {"pack_review", "pack_check", "pack_check_result", "preview_delete_job", "restore_job", "preview_cleanup"} <= {t.name for t in tools.tools}
-            assert not (await s.call_tool("list_jobs", {})).isError
+            assert {"pack_review", "pack_plan_sources", "verify_prism_export", "pack_check", "pack_check_result", "preview_delete_job", "restore_job", "preview_cleanup"} <= {t.name for t in tools.tools}
+            draft = (await s.call_tool("pack_brief", {"action": "save", "patch": {
+                "concept": "Create factory", "filters": {"minecraft": "1.21.1", "loader": "NeoForge",
+                                                            "categories": ["create"], "minimum_downloads": 1000}
+            }})).structuredContent
+            assert not draft["ready"] and draft["next_questions"][0]["fields"] == ["release_types"]
+            incomplete = await s.call_tool("pack_brief", {"action": "start", "draft_id": draft["draft_id"],
+                                                           "expected_revision": draft["revision"]})
+            assert incomplete.isError
+            ready = (await s.call_tool("pack_brief", {"action": "save", "draft_id": draft["draft_id"],
+                "expected_revision": draft["revision"], "patch": {
+                    "filters": {"release_types": [1, 2]},
+                    "delegated_defaults": ["constraints", "extras", "alternative_criteria"]
+                }})).structuredContent
+            assert ready["ready"] and not ready["next_questions"] and ready["effective_filters"]["release_types"] == [1, 2]
+            assert not (await s.call_tool("list_jobs", {})).structuredContent["result"]
             assert (plugin / "skills/curate-minecraft-mods/SKILL.md").exists()
-            return {"protocol": init.protocolVersion, "tools": len(tools.tools), "capabilities": cap}
+            return {"protocol": init.protocolVersion, "tools": len(tools.tools), "capabilities": cap, "intake": "passed"}
 
 
 report = {"client_date": date.today().isoformat(), "method": "Actual ZIP relocation, fresh venv wheel install, standard MCP client",
           "result": "passed", "trial_root": str(trial), "install_seconds": install_seconds,
           "wheel_sha256": hashlib.sha256(next((plugin / "vendor").glob("*.whl")).read_bytes()).hexdigest(),
           "mcp": asyncio.run(check()), "client_ui_installation_tested": False}
-(root / "evidence/package-smoke.json").write_text(json.dumps(report, indent=2))
+(root / "evidence/package-smoke.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 print(json.dumps(report, indent=2))

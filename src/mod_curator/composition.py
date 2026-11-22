@@ -111,7 +111,9 @@ def snapshot(job, pack):
             'filters': deepcopy(job['filters']), 'recheck_ids': list(job.get('recheck_ids', [])),
             'requirements_revision': job['requirements_revision'],
             'overlap_review': job.get('overlap_review'), 'external_projects': deepcopy(job.get('external_projects', {})),
-            'file_pins': deepcopy(job.get('file_pins', {})), 'relationships': deepcopy(job.get('relationships', []))}
+            'file_pins': deepcopy(job.get('file_pins', {})),
+            'install_evidence': deepcopy(job.get('install_evidence', [])),
+            'replacements': deepcopy(job.get('replacements', [])), 'relationships': deepcopy(job.get('relationships', []))}
 
 
 class Composition:
@@ -127,6 +129,7 @@ class Composition:
                 'excluded': len(pack['excluded']), 'manual': len(pack['manual']),
                 'recheck_count': len(job.get('recheck_ids', [])), 'recheck_scope_unspecified': job.get('recheck_scope_unspecified', False), 'status': job['status'], 'stage': job['stage'],
                 'progress': {'cards': job['processed'], 'projects': len(job['projects']), 'decisions': len(job['decisions'])},
+                'search_scopes': job.get('search_scopes', []), 'search_scope_results': job.get('search_scope_results', {}),
                 'related_reports': job.get('legacy_reports', {}), 'external_projects': external_summary(job.get('external_projects', {}))}
 
     def read(self, job_id, group='main', offset=0, limit=30, query=None):
@@ -184,6 +187,12 @@ class Composition:
             raise ValueError('A saved brief needs a concept')
         filters = validate_filters(brief)
         plan = filter_plan(job, filters)
+        if (old_brief.get('search_scopes') != brief.get('search_scopes') or
+                (job.get('search_scopes') and plan['mode'] != 'reuse_existing')):
+            plan = {'mode': 'new_query', 'changed': plan['changed'],
+                    'search_scopes_before': old_brief.get('search_scopes'),
+                    'search_scopes_after': brief.get('search_scopes'),
+                    'reason': 'Individual search scopes have their own filters and thresholds. Keep existing work and start a linked brief for changed coverage.'}
         if plan['mode'] != 'reuse_existing':
             return {'job_id': job_id, 'revision': job['selection_revision'], 'saved': False,
                     'catalogue_plan': plan, 'proposed_brief': brief,
@@ -326,6 +335,26 @@ class Composition:
             result['worker'] = self.engine.launch(job_id)
         return result
 
+    def plan_sources(self, job_id, expected_revision, *, external=None, evidence=None, replacements=None):
+        """Set explicitly provided, version-scoped input sources as a revision."""
+        def apply(job, pack):
+            if external is not None:
+                job['external_projects'] = {
+                    item.project_id: {**item.model_dump(), 'source': 'modrinth', 'name': item.project_id,
+                                      'url': f'https://modrinth.com/mod/{item.project_id}', 'selected': True}
+                    for item in external}
+                if len(job['external_projects']) != len(external):
+                    raise ValueError('Duplicate external project')
+            if evidence is not None:
+                job['install_evidence'] = [item.model_dump() for item in evidence]
+            if replacements is not None:
+                for item in replacements:
+                    if item.previous_project in pack['main'] or item.replacement_project not in pack['main']:
+                        raise ValueError('Record a replacement after updating the composition')
+                job['replacements'] = [item.model_dump() for item in replacements]
+            return {}
+        return self._commit(job_id, expected_revision, 'plan_sources', apply)
+
     def undo(self, job_id, expected_revision):
         def apply(job, pack):
             undone = {entry.get('undoes') for entry in job.get('pack_revisions', []) if entry['kind'] == 'undo'}
@@ -335,6 +364,8 @@ class Composition:
                 raise ValueError('No previous managed edit to undo at this revision')
             before = entry['before']
             job['file_pins'] = deepcopy(before.get('file_pins', {}))
+            for field, default in (('external_projects', {}), ('install_evidence', []), ('replacements', [])):
+                job[field] = deepcopy(before.get(field, default))
             job['relationships'] = deepcopy(before.get('relationships', []))
             pack.clear()
             pack.update(deepcopy(before['pack']))
@@ -401,14 +432,14 @@ class Composition:
         job = self.store.get(job_id)
         selected = at_revision(job, revision)
         pack = selected['pack']
-        if not pack['main']:
+        if not pack['main'] and (curseforge_only or not selected['external_projects']):
             raise ValueError('Choose a nonempty main list')
-        if selected['external_projects'] and not curseforge_only:
-            raise ValueError('This revision includes external projects. Explicitly request a CurseForge-only ZIP to export the supported subset.')
         from .engine import fingerprint
         from .preflight import filters_for, latest, plan_input, plan_key
         filters = filters_for(job, revision)
         plan = latest(self.store, job_id, revision, curseforge_only)
+        if not plan and (selected.get('install_evidence') or (selected['external_projects'] and not curseforge_only)):
+            raise ValueError("Run preflight before exporting external files or dependency evidence.")
         if plan:
             if not plan['ready'] or plan['input_key'] != plan_key(plan_input(job, revision, curseforge_only)):
                 raise ValueError('The saved installation plan is blocked or stale. Run preflight again.')
@@ -422,10 +453,10 @@ class Composition:
                 confirmed={'revision': revision, 'fingerprint': fingerprint(pack['main']), 'at': time.time()},
                 export_options={'name': name, 'loader_version': loader_version},
                 file_pins=selected.get('file_pins', {}), export_plan=plan,
-                exported_from={'job_id': job_id, 'revision': revision, 'external_projects_omitted': selected['external_projects']})
+                exported_from={'job_id': job_id, 'revision': revision, 'external_projects_omitted': selected['external_projects'] if curseforge_only else {}})
         return {**self.engine.launch(export_id), 'source_job_id': job_id, 'revision': revision,
                 'installation_plan_task': plan['task_id'] if plan else None,
-                'external_projects_omitted': external_summary(selected['external_projects'])}
+                'external_projects_omitted': external_summary(selected['external_projects']) if curseforge_only else {}}
 
 
 def external_summary(projects):
@@ -500,7 +531,7 @@ def validate_page(offset, limit):
 
 def wishes_changed(before, after):
     return any(before.get(key) != after.get(key) for key in
-               ('concept', 'hard_requirements', 'preferences', 'alternative_criteria', 'final_size', 'reserve'))
+               ('concept', 'hard_requirements', 'preferences', 'extras', 'alternative_criteria', 'final_size', 'reserve'))
 
 
 def open_prism_import(store, export_job_id):
@@ -521,7 +552,9 @@ def open_prism_import(store, export_job_id):
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     if digest != export.get('sha256'):
         raise ValueError('The archive checksum changed. Export a fresh ZIP.')
-    binary = shutil.which('prismlauncher')
+    from .platform_support import background_options, prism_executable
+
+    binary = prism_executable()
     if binary:
         command = [binary]
     elif shutil.which('flatpak') and subprocess.run(
@@ -533,6 +566,6 @@ def open_prism_import(store, export_job_id):
         return {'status': 'manual_import_required', 'archive': str(archive)}
     with (store.job_dir(export_job_id) / 'prism-import.log').open('ab') as log:
         process = subprocess.Popen([*command, '--import', str(archive)], stdin=subprocess.DEVNULL,
-                                   stdout=log, stderr=log, start_new_session=True)
+                                   stdout=log, stderr=log, **background_options())
     return {'status': 'import_requested', 'archive': str(archive), 'pid': process.pid,
             'next': 'Confirm creation of a new instance in Prism. Check the launcher for import status.'}

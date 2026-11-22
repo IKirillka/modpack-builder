@@ -18,7 +18,7 @@ async def test_stdio_protocol_and_state_between_connections(engine, filters):
             init = await s.initialize()
             assert "No JAR download" in init.instructions
             tools = (await s.list_tools()).tools
-            assert len(tools) == 41
+            assert len(tools) == 43
             cap = (await s.call_tool("capabilities", {})).structuredContent
             assert cap["destinations"]["mods"] == str(engine.store.destination("mods"))
             status = (await s.call_tool("job_status", {"job_id": job})).structuredContent

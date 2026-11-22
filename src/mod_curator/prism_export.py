@@ -73,8 +73,10 @@ async def loader_version(filters, requested=None):
                     "version_metadata_sha256": detail_hash}
 
 
-def build_manifest(lock, filters, loader, name, version="1.0.0"):
-    if not lock.get("files") or not lock.get("roots"):
+def build_manifest(lock, filters, loader, name, version="1.0.0", *, has_verified_external=False):
+    if (not lock.get("files") or not lock.get("roots")) and not (
+        has_verified_external and not lock.get("files") and not lock.get("roots")
+    ):
         raise SourceError("DRAFT_ONLY: nonempty resolved roots and file closure required")
     entries, seen_files = [], set()
     files = {int(pid): file for pid, file in lock["files"].items()}
@@ -103,7 +105,16 @@ def build_manifest(lock, filters, loader, name, version="1.0.0"):
             "version": version, "author": f"{DISPLAY_NAME} user", "files": entries, "overrides": "overrides"}
 
 
-def write_pack(manifest, destination: Path, basename):
+def write_pack(manifest, destination: Path, basename, overrides=None):
+    from .modrinth import safe_jar_name
+    overrides = overrides or {}
+    resources = {f'overrides/mods/{safe_jar_name(name)}': path for name, path in overrides.items()}
+    expected_files = {"manifest.json", "overrides/", *resources}
+
+    def digest(path):
+        with path.open('rb') as stream:
+            return hashlib.file_digest(stream, 'sha256').hexdigest()
+
     if not re.fullmatch(r"[a-zA-Z0-9_-]+\.zip", basename):
         raise ValueError("Unsafe archive basename")
     final = destination / basename
@@ -116,15 +127,21 @@ def write_pack(manifest, destination: Path, basename):
         try:
             with zipfile.ZipFile(final) as z:
                 entries = z.infolist()
-                if (sorted(i.filename for i in entries) != ["manifest.json", "overrides/"]
+                if (len(entries) != len(expected_files) or {i.filename for i in entries} != expected_files
                         or any(stat.S_ISLNK(i.external_attr >> 16) for i in entries)
                         or z.getinfo("manifest.json").file_size != len(raw)
                         or z.getinfo("overrides/").file_size != 0
                         or z.read("manifest.json") != raw):
                     raise SourceError("EXPORT_EXISTS: existing archive differs; never overwrite")
+                for member, path in resources.items():
+                    if z.getinfo(member).file_size != path.stat().st_size:
+                        raise SourceError("EXPORT_EXISTS: existing override differs; never overwrite")
+                    with z.open(member) as stream:
+                        if hashlib.file_digest(stream, 'sha256').hexdigest() != digest(path):
+                            raise SourceError("EXPORT_EXISTS: existing override differs; never overwrite")
         except (OSError, zipfile.BadZipFile) as exc:
             raise SourceError("EXPORT_EXISTS: invalid ZIP; never overwrite") from exc
-        return {"path": str(final), "sha256": hashlib.sha256(final.read_bytes()).hexdigest(), "reused": True}
+        return {"path": str(final), "sha256": digest(final), "reused": True}
 
     if final.exists() or final.is_symlink():
         return reuse()
@@ -134,12 +151,17 @@ def write_pack(manifest, destination: Path, basename):
             with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as z:
                 z.writestr("manifest.json", raw)
                 z.writestr("overrides/", "")
+                for member, path in resources.items():
+                    z.write(path, member, compress_type=zipfile.ZIP_STORED)
             stream.flush()
             os.fsync(stream.fileno())
         try:
-            os.link(part, final)  # atomic no-clobber publication
+            if os.name == "nt":
+                os.rename(part, final)  # Windows rename refuses an existing target.
+            else:
+                os.link(part, final)  # POSIX rename can overwrite an existing target.
         except FileExistsError:
             return reuse()
     finally:
         part.unlink(missing_ok=True)
-    return {"path": str(final), "sha256": hashlib.sha256(final.read_bytes()).hexdigest(), "reused": False}
+    return {"path": str(final), "sha256": digest(final), "reused": False}

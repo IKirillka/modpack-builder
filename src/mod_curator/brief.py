@@ -17,6 +17,21 @@ FILTER_FIELDS = {
     'minimum_downloads', 'page_size', 'destination', 'allow_prerelease', 'release_types',
 }
 QUERY_FIELDS = {'minecraft', 'loader', 'categories', 'excluded_categories', 'search', 'page_size'}
+SCOPED_FIELDS = {'categories', 'excluded_categories', 'search', 'minimum_downloads'}
+
+
+class SearchScope(BaseModel):
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    label: str = Field(min_length=1, max_length=80)
+    categories: list[str] = Field(default_factory=list)
+    excluded_categories: list[str] = Field(default_factory=list)
+    search: str = Field(default='', max_length=200)
+    minimum_downloads: int = Field(ge=0)
+    all_categories: bool = False
+
+
+ExtraPolicy = Literal['prefer', 'allow', 'skip']
+DefaultDecision = Literal['release_types', 'constraints', 'extras', 'alternative_criteria']
 
 
 class BriefPatch(BaseModel):
@@ -31,12 +46,28 @@ class BriefPatch(BaseModel):
     reserve: bool | None = None
     final_size: int | None = Field(default=None, ge=1)
     agent_choices: dict[str, str] | None = None
+    search_scopes: list[SearchScope] | None = None
+    all_categories: bool | None = None
+    extras: dict[Literal['decoration', 'quality_of_life', 'performance'], ExtraPolicy] | None = None
+    delegated_defaults: list[DefaultDecision] = Field(default_factory=list)
+    unresolved: dict[str, str] | None = None
+
 
 
 def merge_brief(base, changes):
     result = deepcopy(base)
+    changes = changes.copy()
+    delegated = changes.pop('delegated_defaults', [])
+    answers = set(result.get('answered_constraints', ()))
+    for key in ('required_ids', 'excluded_ids'):
+        if key in changes:
+            if changes[key] is None:
+                answers.discard(key)
+            else:
+                answers.add(key)
+    result['answered_constraints'] = sorted(answers)
     for key, value in changes.items():
-        if key in ('filters', 'hard_requirements', 'preferences', 'agent_choices') and value is not None:
+        if key in ('filters', 'hard_requirements', 'preferences', 'agent_choices', 'extras', 'unresolved') and value is not None:
             # Empty values remove a preference/choice by key. Unmentioned keys survive.
             target = result.setdefault(key, {})
             for name, entry in value.items():
@@ -66,10 +97,65 @@ def merge_brief(base, changes):
     changed_fields.update((changes.get('filters') or {}).keys())
     for key in changed_fields - updated_choices.keys():
         choices.pop(key, None)
-    if result.get('filters'):
-        # Validate even a partial filter set without manufacturing answers in the draft.
-        validate_filters(result)
+    filters = result.setdefault('filters', {})
+    if 'allow_prerelease' in (changes.get('filters') or {}) and 'release_types' not in changes['filters']:
+        filters.pop('release_types', None)
+    if 'release_types' in delegated and not has_release_choice(filters):
+        filters['release_types'] = [1]
+        choices['release_types'] = 'User delegated. Stable releases by default.'
+    if 'constraints' in delegated:
+        result['answered_constraints'] = ['excluded_ids', 'required_ids']
+        choices['constraints'] = 'User delegated. No additional mandatory projects or exclusions.'
+    if 'extras' in delegated:
+        extras = result.get('extras') or {}
+        for key, value in {'decoration': 'skip', 'quality_of_life': 'allow', 'performance': 'allow'}.items():
+            if key not in extras:
+                extras[key] = value
+                choices[key] = 'User delegated this optional role.'
+        result['extras'] = extras
+    if 'alternative_criteria' in delegated and not result.get('alternative_criteria'):
+        result['alternative_criteria'] = ('Keep compatible complements. Prefer useful functions; '
+                                           'use downloads to break ties between genuinely equivalent options.')
+        choices['alternative_criteria'] = 'User delegated how to rank alternatives.'
+    if 'extras' in changes:
+        for key in (changes['extras'] or {}):
+            if key not in updated_choices:
+                choices.pop(key, None)
+    if 'constraints' not in delegated and {'required_ids', 'excluded_ids'} & changes.keys():
+        choices.pop('constraints', None)
+    # Validate partial inputs without manufacturing choices in the draft.
+    validate_filters(result)
+    effective_scopes(result)
     return result
+
+
+def has_release_choice(filters):
+    return filters.get('release_types') is not None or filters.get('allow_prerelease') is not None
+
+
+def effective_scopes(brief):
+    base = validate_filters(brief)
+    scopes = brief.get('search_scopes') or []
+    result = []
+    seen = set()
+    labels = set()
+    for raw in scopes:
+        scope = SearchScope.model_validate(raw)
+        if scope.label.casefold() in labels:
+            raise ValueError('Each search scope needs a distinct label')
+        if not (scope.categories or scope.search or scope.all_categories):
+            raise ValueError('Choose categories, a search term, or explicitly allow all categories for every scope')
+        filters = Filters.model_validate({**base.model_dump(),
+                    **scope.model_dump(exclude={'label', 'all_categories'})})
+        plan = filters.model_dump(exclude={'wishes'})
+        signature = json.dumps(plan, sort_keys=True)
+        if signature in seen:
+            raise ValueError('Two search scopes use the same effective filters')
+        seen.add(signature)
+        labels.add(scope.label.casefold())
+        result.append({'label': scope.label, 'filters': plan})
+    return result
+
 
 
 def validate_filters(brief):
@@ -84,6 +170,10 @@ def wishes(brief):
     for section, title in [('hard_requirements', 'Hard requirements'), ('preferences', 'Flexible preferences')]:
         for key, value in (brief.get(section) or {}).items():
             lines.append(f'{title} / {key} — {value}')
+    descriptions = {'prefer': 'prioritize relevant projects', 'allow': 'allow when useful',
+                    'skip': 'skip standalone projects of this role'}
+    for key, value in (brief.get('extras') or {}).items():
+        lines.append(f"Optional role / {key} — {descriptions[value]}")
     if brief.get('alternative_criteria'):
         lines.append('Alternative criteria — ' + brief['alternative_criteria'])
     if brief.get('final_size'):
@@ -127,6 +217,37 @@ def filter_plan(job, new_filters):
             'reason': 'A verified catalogue boundary is unavailable. Reuse matching cached descriptions and facts.'}
 
 
+def next_questions(missing, brief, unresolved, destinations):
+    if unresolved:
+        return [{'fields': [key], 'question': question} for key, question in list(unresolved.items())[:3]]
+    extras = {'decoration': 'декор', 'quality_of_life': 'QoL', 'performance': 'оптимизация'}
+    questions = {
+        'concept': 'Что ты хочешь делать в игре? Какие механики должны стать основой сборки?',
+        'minecraft': 'На какой версии Minecraft собираем?',
+        'loader': 'Какой загрузчик используем?',
+        'search_scope': 'В каких категориях или по каким запросам искать? Например, Create для аддонов и Performance для оптимизации.',
+        'minimum_downloads': 'Какой строгий нижний порог скачиваний нужен? Если по разделам пороги разные, укажи каждый отдельно.',
+        'release_types': 'Какие файлы допустимы: только релизы, также бета или также альфа?',
+        'constraints': 'Какие моды обязательны, а какие исключить? Если жёстких ограничений нет, так и скажи.',
+        'extras': 'Что включать из дополнительных ролей: ' + ', '.join(
+            label for key, label in extras.items() if key not in (brief.get('extras') or {})) + '?',
+        'alternative_criteria': 'Как выбирать между заменами: по нужным функциям, по скачиваниям среди равноценных или по другому правилу?',
+        'destination': 'Какую папку выбрать для ZIP?' if destinations else 'Для экспорта нужна зарегистрированная локальная папка.',
+    }
+    answered = brief.get('answered_constraints') or []
+    if answered == ['required_ids']:
+        questions['constraints'] = 'Какие моды или механики нужно исключить? Можно ответить «ограничений нет».'
+    elif answered == ['excluded_ids']:
+        questions['constraints'] = 'Какие моды обязательны? Можно ответить «нет обязательных».'
+    if 'concept' in missing:
+        return [{'fields': ['concept'], 'question': questions['concept']}]
+    for cluster in (('minecraft', 'loader'), ('search_scope', 'minimum_downloads', 'release_types'),
+                    ('constraints', 'extras', 'alternative_criteria'), ('destination',)):
+        if fields := [key for key in cluster if key in missing]:
+            return [{'fields': [key], 'question': questions[key]} for key in fields]
+    return []
+
+
 class Intake:
     def __init__(self, engine):
         self.engine = engine
@@ -145,10 +266,13 @@ class Intake:
         if not carry_manual:
             base.pop('required_ids', None)
             base.pop('excluded_ids', None)
+            if origin:
+                base.pop('answered_constraints', None)
         manual = deepcopy(pack_state(origin)['manual']) if origin and carry_manual else {}
         if origin and carry_manual:
             base['required_ids'] = [int(key) for key, entry in manual.items() if entry['list'] == 'main']
             base['excluded_ids'] = [int(key) for key, entry in manual.items() if entry['list'] == 'excluded']
+            base['answered_constraints'] = ['excluded_ids', 'required_ids']
         with self.store.connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
             if copy_from_job:
@@ -185,17 +309,39 @@ class Intake:
     def summary(self, data):
         brief = data['brief']
         destinations = list(self.store.config()['destinations'])
+        known = brief.get('filters') or {}
+        scopes = effective_scopes(brief)
         missing = [] if brief.get('concept') else ['concept']
-        missing += [key for key in ('minecraft', 'loader', 'minimum_downloads') if key not in brief.get('filters', {})]
-        destination = brief.get('filters', {}).get('destination')
+        missing.extend(key for key in ('minecraft', 'loader') if not known.get(key))
+        if not (scopes or known.get('categories') or known.get('search') or brief.get('all_categories')):
+            missing.append('search_scope')
+        if not scopes and known.get('minimum_downloads') is None:
+            missing.append('minimum_downloads')
+        if not has_release_choice(known):
+            missing.append('release_types')
+        if set(brief.get('answered_constraints', ())) != {'required_ids', 'excluded_ids'}:
+            missing.append('constraints')
+        if set(brief.get('extras') or {}) != {'decoration', 'quality_of_life', 'performance'}:
+            missing.append('extras')
+        if not brief.get('alternative_criteria'):
+            missing.append('alternative_criteria')
+        destination = known.get('destination')
         if destination not in destinations and (destination or len(destinations) != 1):
             missing.append('destination')
+        unresolved = {k: v for k, v in (brief.get('unresolved') or {}).items() if v}
+        effective = self.effective(brief).model_dump(exclude={'wishes'}) if not missing and not unresolved else None
+        for scope in scopes:
+            if effective:
+                scope['filters']['destination'] = effective['destination']
+        displayed_filters = {key: value for key, value in effective.items()
+                             if not scopes or key not in SCOPED_FIELDS} if effective is not None else None
         return {key: data[key] for key in ('draft_id', 'revision', 'brief', 'job_id') if key in data} | {
-            'ready': not missing, 'missing': missing, 'destinations': destinations,
-            'source': 'CurseForge', 'sort': 'Total Downloads descending',
-            'effective_filters': None if missing else self.effective(brief).model_dump(exclude={'wishes'}),
-            'defaults_to_show': [] if missing else [key for key, value in self.effective(brief).model_dump(exclude={'wishes'}).items()
-                                if key not in brief.get('filters', {}) and value is not None],
+            'ready': effective is not None, 'missing': missing, 'unresolved': unresolved,
+            'next_questions': next_questions(missing, brief, unresolved, destinations),
+            'destinations': destinations, 'source': 'CurseForge', 'sort': 'Total Downloads descending',
+            'effective_filters': displayed_filters, 'search_scopes': scopes,
+            'defaults_to_show': [key for key, value in (displayed_filters or {}).items()
+                                 if key not in known and value is not None],
         }
 
     def effective(self, brief):
@@ -212,16 +358,23 @@ class Intake:
             data = self._read(connection, draft_id)
             if data.get('job_id'):
                 return {'job_id': data['job_id'], 'already_started': True}
-            if expected_revision != data['revision'] or not self.summary(data)['ready']:
-                raise ValueError('Brief incomplete or stale. Read draft before starting.')
+            if expected_revision != data['revision']:
+                raise ValueError('Brief revision is stale. Read the current draft.')
+            summary = self.summary(data)
+            if not summary['ready']:
+                fields = list(dict.fromkeys([*summary['missing'], *summary['unresolved']]))
+                raise ValueError('Brief incomplete. Resolve before starting: ' + ', '.join(fields))
             brief = data['brief']
             filters = self.effective(brief)
+            scopes = summary['search_scopes']
             self.store.destination(filters.destination)
             effective = filters.model_dump(exclude={'wishes'})
-            for key, value in effective.items():
-                if key not in brief['filters'] and value is not None:
-                    brief['agent_choices'].setdefault(key, 'Default of the installed plugin')
-            brief['filters'] = effective
+            brief['filters'] = {
+                key: value for key, value in effective.items()
+                if not scopes or key not in SCOPED_FIELDS or key in brief['filters']
+            }
+            for key in summary['defaults_to_show']:
+                brief['agent_choices'].setdefault(key, 'Default of the installed plugin')
             manual = data['carried_manual']
             for key in ('required_ids', 'excluded_ids'):
                 placement = 'main' if key == 'required_ids' else 'excluded'
@@ -236,7 +389,8 @@ class Intake:
             job_id = self.store.create(filters.model_dump(), connection=connection, brief=brief,
                     pending_additions=main + reserve, selection=main,
                     composition={'main': main, 'reserve': reserve, 'excluded': excluded, 'manual': manual},
-                    reuse_descriptions_from=data.get('copy_from_job'))
+                    reuse_descriptions_from=data.get('copy_from_job'),
+                    **({'search_scopes': scopes, 'search_scope_index': 0} if scopes else {}))
             data['job_id'] = job_id
             connection.execute('UPDATE intake_drafts SET data=?,updated_at=? WHERE id=?',
                                (json.dumps(data, ensure_ascii=False), time.time(), draft_id))

@@ -7,8 +7,12 @@ from mod_curator.models import SourceError
 from mod_curator.source import CurseForge, catalog_url, parse_catalog
 
 
-def html(projects, total=None, has_next=False):
+def html(projects, total=None, has_next=False, *, category=None):
     data = {"tileProjects": projects}
+    category_control = ''
+    if category:
+        data['category'] = {'slug': category, 'name': category}
+        category_control = f'<input checked aria-label="{category}">'
     payload = "1:" + json.dumps(data, separators=(",", ":"))
     flight = "self.__next_f.push(" + json.dumps([1, payload]) + ")"
     cards = "".join(f'<div class="project-card"><a class="name" href="/minecraft/mc-mods/{p["slug"]}">{p["name"]}</a></div>' for p in projects)
@@ -16,7 +20,7 @@ def html(projects, total=None, has_next=False):
     <input checked aria-label="Mods"><input checked aria-label="1.21.1"><input checked aria-label="NeoForge filter">
     <div class="results-count">{len(projects) if total is None else total:,} Projects</div>
     <a aria-label="Next Page" class="{'btn-next' if has_next else 'btn-next disabled'}"></a>
-    {cards}<script>{flight}</script>'''
+    {category_control}{cards}<script>{flight}</script>'''
 
 
 def project(n=62451353):
@@ -99,7 +103,7 @@ async def test_image_only_description_is_not_reported_as_blank(tmp_path, monkeyp
     try:
         with pytest.raises(SourceError,match='DESCRIPTION_IMAGE_ONLY'):
             await source._describe_once({'id':1,'url':'https://www.curseforge.com/minecraft/mc-mods/example'})
-        assert (tmp_path/'description-1.html').is_file()
+        assert (tmp_path/'description-1.html.gz').is_file()
     finally:
         await source.close()
 
@@ -151,5 +155,35 @@ async def test_exact_file_checks_prefix_and_always_refreshes_relations(filters, 
         # The ordinary resolver reuses its dependency evidence. Export requests fresh verification.
         await source.complete_file(source.normalize_file(item, pid, "test"))
         assert len(visits) == 4
+    finally:
+        await source.close()
+
+
+def test_identity_allows_observed_underscore_but_rejects_unsafe_slug(filters):
+    observed = {**project(), "id": 426386, "slug": "shrink_", "name": "Shrink."}
+    parsed = parse_catalog(html([observed]), catalog_url(filters, 1), filters, 1)
+    assert parsed.cards[0]["slug"] == "shrink_"
+    assert parsed.cards[0]["downloads"] == observed["downloadsCount"]
+    for slug in ("..", "a%2fb", "a\\b"):
+        with pytest.raises(SourceError, match="invalid project identity"):
+            parse_catalog(html([{**observed, "slug": slug}]), catalog_url(filters, 1), filters, 1)
+
+
+async def test_closed_cdp_explains_how_to_resume():
+    from playwright.async_api import Error
+    from types import SimpleNamespace
+
+    async def no_browser(address, timeout):
+        assert address == "http://127.0.0.1:9222" and timeout == 10000
+        raise Error("connection refused")
+
+    async def stop():
+        pass
+
+    source = CurseForge({"transport": "cdp"})
+    source.playwright = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=no_browser), stop=stop)
+    try:
+        with pytest.raises(SourceError, match="CDP_UNAVAILABLE.*resume the existing job"):
+            await source.html("https://www.curseforge.com/minecraft/search")
     finally:
         await source.close()

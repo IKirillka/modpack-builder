@@ -19,6 +19,7 @@ from .analysis_roles import (
 from .facts import Facts, cache_key, normalize
 from .lifecycle import require_available
 from .store import Store
+from .platform_support import background_options
 
 
 class SettingsPatch(BaseModel):
@@ -213,7 +214,7 @@ class Economy:
         folder = self.store.job_dir(job_id) / 'extraction-runs'
         for bid in batches:
             try:
-                metrics = json.loads((folder / bid / 'metrics.json').read_text())
+                metrics = json.loads((folder / bid / 'metrics.json').read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
             observed = metrics.get('observed') or {}
@@ -287,9 +288,9 @@ class Economy:
 
     def launch(self, run_id):
         with (self.store.root / 'economy-worker.log').open('ab') as log:
-            subprocess.Popen([sys.executable, '-m', 'mod_curator', 'economy-worker', run_id],
+            subprocess.Popen([sys.executable, '-X', 'utf8', '-m', 'mod_curator', 'economy-worker', run_id],
                              env={**os.environ, 'MOD_CURATOR_HOME': str(self.store.root)},
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, **background_options())
 
     def work(self, run_id, runner=None):
         if runner is None:

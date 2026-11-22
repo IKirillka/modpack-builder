@@ -17,6 +17,7 @@ from .models import Cancelled, Decision, Filters, SourceError
 from .resolver import resolve
 from .source import CurseForge
 from .store import Store
+from .platform_support import background_options
 
 
 def fingerprint(ids):
@@ -30,9 +31,9 @@ class Engine:
     def launch(self, job_id):
         path = self.store.job_dir(job_id)
         with open(path / "worker.log", "ab") as log:
-            p = subprocess.Popen([sys.executable, "-m", "mod_curator", "worker", job_id],
+            p = subprocess.Popen([sys.executable, "-X", "utf8", "-m", "mod_curator", "worker", job_id],
                                  env={**os.environ, "MOD_CURATOR_HOME": str(self.store.root)},
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, **background_options())
         return {"job_id": job_id, "worker_pid": p.pid, "progress_tool": "job_status"}
 
     def start(self, params):
@@ -45,14 +46,19 @@ class Engine:
         self.store.patch(job_id, cancel_requested=True)
         return {"job_id": job_id, "cancel_requested": True}
 
-    def resume(self, job_id):
+    def resume(self, job_id, *, max_states=None):
         d = self.store.get(job_id)
         if self.worker_active(job_id, known_exists=True):
             return {"job_id": job_id, "status": d["status"], "worker_active": True}
         if d["stage"] in ("awaiting_analysis", "done"):
             return {"job_id": job_id, "status": d["status"], "next": "analysis_batch or revise_selection"}
-        self.store.mutate(job_id, lambda s: s.update(cancel_requested=False, status="queued", reason=None, recheck=True),
-                          after=lambda db, _: require_available(db, job_id))
+        if max_states is not None and (d['stage'] != 'pack_check' or not 1 <= max_states <= 2_000_000):
+            raise ValueError("A search budget of 1..2000000 can be set on a resumable preflight")
+        def resume_state(state):
+            state.update(cancel_requested=False, status="queued", reason=None, recheck=True)
+            if max_states is not None:
+                state['check_options']['max_states'] = max_states
+        self.store.mutate(job_id, resume_state, after=lambda db, _: require_available(db, job_id))
         return self.launch(job_id)
 
     def check_cancel(self, job_id):
@@ -84,6 +90,7 @@ class Engine:
             "analysis_complete_for_entire_set": d["projects"].keys() <= d["decisions"].keys(),
             "files_total": len(d.get("lock", {}).get("files", {})),
             "files_finished": sum(r.get("status") in ("downloaded", "already_verified") for r in d.get("downloads", {}).values()),
+            "search_scope_results": d.get("search_scope_results", {}),
             "recoverable_interruption": d["status"] in ("running", "queued") and not busy}
 
     def worker_active(self, job_id, *, known_exists=False):
@@ -124,8 +131,14 @@ class Engine:
                 begin = time.monotonic()
                 try:
                     if stage == "collect":
+                        if d.get('search_scopes') and isinstance(source, CurseForge):
+                            capture_dir = self.store.job_dir(job_id) / f"search-{d['search_scope_index'] + 1}"
+                            capture_dir.mkdir(exist_ok=True)
+                            source.evidence_dir = capture_dir
                         await self.collect(job_id, source)
                     elif stage == "describe":
+                        if d.get('search_scopes') and isinstance(source, CurseForge):
+                            source.evidence_dir = self.store.job_dir(job_id)
                         await self.describe(job_id, source)
                     elif stage == "export":
                         await self.export_prism(job_id, source)
@@ -163,10 +176,20 @@ class Engine:
 
     async def collect(self, job_id, source):
         d = self.store.get(job_id)
-        f = Filters.model_validate(d["filters"])
+        scopes = d.get('search_scopes') or []
+        scope_index = d.get('search_scope_index', 0)
+        effective = scopes[scope_index]['filters'] if scopes else {}
+        f = Filters.model_validate({**d["filters"], **effective})
+
+        def active_pages(state):
+            if not scopes:
+                return state["pages"]
+            return [page for page in state['pages'] if page.get('search_scope_index') == scope_index]
+
+        pages = active_pages(d)
         replay = None
-        if d.get("recheck") and d["pages"]:
-            last = d["pages"][-1]
+        if d.get("recheck") and pages:
+            last = pages[-1]
             page = await source.page(f, last["number"])
             ids = [c["id"] for c in page.cards]
             values = [c.get("downloads") for c in page.cards]
@@ -176,8 +199,13 @@ class Engine:
                         "previous_pages": len(s["pages"]), "previous_cards": s["processed"],
                         "at_page": last["number"], "at": time.time(),
                     })
-                    s.update(pages=[], next_page=1, processed=0, early_stop=False, recheck=False,
-                             catalogue_uncertain=True)
+                    if scopes:
+                        s['pages'] = [p for p in s['pages'] if p.get('search_scope_index') != scope_index]
+                        s['processed'] = sum(len(p['ids']) for p in s['pages'])
+                        s['catalogue_scopes_uncertain'] = True
+                    else:
+                        s.update(pages=[], processed=0)
+                    s.update(next_page=1, early_stop=False, recheck=False, catalogue_uncertain=True)
                     s["warnings"].append("CATALOG_CHANGED_ON_RESUME: replayed from page 1; saved projects kept")
                     return s
                 d = self.store.mutate(job_id, restart)
@@ -192,6 +220,7 @@ class Engine:
                 replay = page
         while True:
             self.check_cancel(job_id)
+            pages = active_pages(d)
             number = d["next_page"]
             page = replay if replay is not None else await source.page(f, number)
             replay = None
@@ -201,18 +230,18 @@ class Engine:
             ids = [c["id"] for c in page.cards]
             if page.has_next and not ids:
                 raise SourceError("INCOMPLETE_PAGE: empty page before end of catalogue")
-            if any(ids == p["ids"] and ids for p in d["pages"]):
+            if any(ids == p["ids"] and ids for p in pages):
                 raise SourceError("REPEATED_PAGE: pagination did not advance; incomplete")
-            history_ids = {i for p in d["pages"] for i in p["ids"]}
+            history_ids = {i for p in pages for i in p["ids"]}
             warnings = []
             if len(ids) != len(set(ids)) or set(ids) & history_ids:
                 warnings.append("DUPLICATES_OR_PAGE_SHIFT: completeness uncertain; early stop disabled")
-            if d["pages"] and page.total != d["pages"][-1]["total"]:
+            if pages and page.total != pages[-1]["total"]:
                 warnings.append("CATALOG_TOTAL_CHANGED: completeness uncertain; early stop disabled")
             neighbors = [{"id": pid, "downloads": n, "page": number, "position": pos}
                          for pos, (pid, n) in enumerate(zip(ids, values), 1)]
-            if d["pages"] and d["pages"][-1]["ids"]:
-                prev = d["pages"][-1]
+            if pages and pages[-1]["ids"]:
+                prev = pages[-1]
                 neighbors.insert(0, {"id": prev["ids"][-1], "downloads": prev["last_downloads"],
                                      "page": prev["number"], "position": len(prev["ids"])})
             violations = [{"before": a, "after": b} for a, b in zip(neighbors, neighbors[1:])
@@ -220,7 +249,7 @@ class Engine:
             if violations:
                 warnings.append("SORT_ORDER_VIOLATION: scanning whole catalogue; completeness uncertain")
             early = (d["early_stop"] and page.order_guaranteed and not warnings
-                     and all(p.get("order_guaranteed") for p in d["pages"]))
+                     and all(p.get("order_guaranteed") for p in pages))
             boundary = next((i for i, n in enumerate(values) if n <= f.minimum_downloads), None)
             if early and boundary is not None:
                 accepted = page.cards[:boundary]
@@ -235,15 +264,22 @@ class Engine:
                 for warning in warnings:
                     if warning not in s["warnings"]:
                         s["warnings"].append(warning)
-                s["catalogue_uncertain"] = (s.get("catalogue_uncertain", bool(d["warnings"] and not d["early_stop"]))
+                s["catalogue_uncertain"] = (s.get("catalogue_uncertain", not scopes and bool(d["warnings"] and not d["early_stop"]))
                                              or bool(warnings))
                 if violations:
+                    if scopes:
+                        for pair in violations:
+                            pair['search_scope_index'] = scope_index
                     s.setdefault("sort_violations", []).extend(violations)
                 seen = set(s["order"])
                 for card in accepted:
                     key = str(card["id"])
                     if key not in s["projects"]:
                         s["projects"][key] = card
+                    if scopes:
+                        sightings = s["projects"][key].setdefault('search_matches', {})
+                        sightings.setdefault(scopes[scope_index]['label'], {
+                            'downloads': card['downloads'], 'page': number, 'position': card['position']})
                     if card["id"] not in seen:
                         s["order"].append(card["id"])
                         seen.add(card["id"])
@@ -255,6 +291,10 @@ class Engine:
                                    "evidence": page.evidence, "accepted_ids": accepted_ids,
                                    "order_guaranteed": page.order_guaranteed,
                                    "threshold_comparisons": boundary + 1 if early and boundary is not None else len(values)})
+                if scopes:
+                    s['pages'][-1]['search_scope_index'] = scope_index
+                    s['activity'] = {'operation': 'collect', 'search_scope': scopes[scope_index]['label'],
+                                     'scope_index': scope_index, 'scope_count': len(scopes), 'page': number}
                 s.update(next_page=number + 1, early_stop=early, processed=s["processed"] + len(page.cards),
                          recheck=False)
                 if early and boundary is not None or not page.has_next:
@@ -265,9 +305,24 @@ class Engine:
                         coverage = "uncertain_catalog_scanned"
                     else:
                         coverage = "observed_catalog_scanned"
+                    if scopes:
+                        completed = s.setdefault('search_scope_results', {})
+                        completed[scopes[scope_index]['label']] = {
+                            'reason': reason, 'completeness': coverage, 'cards': sum(len(p['ids']) for p in pages) + len(ids),
+                            'pages': number, 'filters': effective}
+                        if coverage == 'uncertain_catalog_scanned':
+                            s['catalogue_scopes_uncertain'] = True
+                        if scope_index + 1 < len(scopes):
+                            s.update(search_scope_index=scope_index + 1, next_page=1, early_stop=True,
+                                     catalogue_uncertain=False)
+                            return s
+                        reason = 'catalog_end' if all(row['reason'] == 'catalog_end' for row in completed.values()) else 'scopes_finished'
+                        coverage = ('uncertain_catalog_scanned' if s.get('catalogue_scopes_uncertain') else
+                                    'observed_scopes_scanned')
                     s.update(reason=reason, collection_reason=reason, completeness=coverage, stage="describe")
                     s["catalogue"] = {"finished": True, "reason": reason, "completeness": coverage,
-                                      "early_stop_used": reason == "threshold",
+                                      "early_stop_used": (any(row['reason'] == 'threshold' for row in completed.values())
+                                                          if scopes else reason == "threshold"),
                                       "last_page_order_guaranteed": page.order_guaranteed}
                     if s.get("extension"):
                         existing = set(s["extension"]["existing_projects"])
@@ -275,7 +330,7 @@ class Engine:
                 return s
 
             d = self.store.mutate(job_id, commit)
-            if d["stage"] != "collect":
+            if d["stage"] != "collect" or d.get('search_scope_index', 0) != scope_index:
                 return
 
     async def describe(self, job_id, source):
@@ -461,6 +516,9 @@ class Engine:
                            "analysis": d["decisions"].get(str(i))} for i in d["selection"]]}
 
     def confirm(self, job_id, revision, selection_fingerprint, *, target="jars", pack_name="Curated Create Trial", loader_version=None):
+        if target == "jars" and os.name == "nt":
+            raise ValueError("Direct JAR download requires POSIX. Export a CurseForge ZIP and import it in Prism Launcher.")
+
         def confirm(d):
             self.idle(d)
             if revision != d["selection_revision"] or selection_fingerprint != fingerprint(d["selection"]):
@@ -472,6 +530,8 @@ class Engine:
             if target == "prism":
                 from .preflight import latest, plan_input, plan_key
                 plan = latest(self.store, job_id, revision)
+                if not plan and (d.get('external_projects') or d.get('install_evidence')):
+                    raise ValueError("Run the revision preflight before exporting external files or dependency evidence.")
                 if plan and (not plan['ready'] or plan['input_key'] != plan_key(plan_input(d, revision))):
                     raise ValueError("The saved installation plan is blocked or stale. Run preflight again.")
                 if plan and loader_version and loader_version != plan['loader']['version']:
@@ -508,17 +568,48 @@ class Engine:
         loader = await loader_version(f, plan['loader']['version'] if plan else options.get("loader_version"))
         if plan and any(loader.get(k) != plan['loader'].get(k) for k in ('id', 'version_metadata_sha256')):
             raise SourceError("INSTALLATION_PLAN_STALE: loader metadata changed. Run preflight again.")
-        manifest = build_manifest(lock, f, loader, options.get("name", "Curated mods"))
+        external = plan.get('external_items', []) if plan else []
+        manifest = build_manifest(lock, f, loader, options.get("name", "Curated mods"),
+                                  has_verified_external=bool(external))
         self.check_cancel(job_id)
-        archive = write_pack(manifest, self.store.destination(f.destination), f"curated-{job_id}-r{d['selection_revision']}.zip")
+        destination = self.store.destination(f.destination)
+        basename = f"curated-{job_id}-r{d['selection_revision']}.zip"
+        overrides = {}
+        if external:
+            import tempfile
+            import httpx
+            from pathlib import Path
+            from .modrinth import Modrinth
+            with tempfile.TemporaryDirectory(dir=self.store.job_dir(job_id), prefix='prism-overrides-') as folder:
+                async with httpx.AsyncClient(timeout=45, headers={'User-Agent': 'Modpack Builder'}) as client:
+                    provider = Modrinth(client)
+                    for item in external:
+                        self.check_cancel(job_id)
+                        await provider.verify_item(item, f)
+                        if item['acquisition'] != 'manual':
+                            path = Path(folder) / item['file_name']
+                            await provider.download(item, path)
+                            overrides[item['file_name']] = path
+                self.check_cancel(job_id)
+                archive = write_pack(manifest, destination, basename, overrides)
+        else:
+            archive = write_pack(manifest, destination, basename)
         report = {"ready": True, "status": "ready_for_prism_import", **archive, "manifest": manifest,
-                  "loader": loader, "files_count": len(manifest["files"]), "dependencies_complete": True,
-                  "dependency_coverage": "CurseForge file-declared mandatory project relations; JAR version ranges not checked before Prism downloads",
+                  "loader": loader, "files_count": len(manifest["files"]) + len(external), "dependencies_complete": True,
+                  "dependency_coverage": "Exact source relations and recorded supplemental evidence. Runtime untested.",
+                  "jar_evidence_count": len((plan or {}).get('jar_evidence', {}).get('verified_files', [])),
                   "installation_plan_task": plan['task_id'] if plan else None,
-                  "prism_import_tested": False, "manual_downloads": "Unknown for files without explicit distribution metadata until Prism import"}
+                  "prism_import_tested": False, "manual_downloads": [item for item in (plan or {}).get('items', []) if item['acquisition'] == 'manual'],
+                  "override_confirmation": list(overrides),
+                  "verification_stages": {"plan": "metadata_ready" if plan else "resolved_at_export",
+                                          "zip": "written", "import": "untested", "main_menu": "untested",
+                                          "world": "untested", "mechanics": "untested"}}
+        from .verification import receipt, write_receipt
+        report['receipt_path'] = write_receipt(self.store, job_id, d, report)
+        evidence = receipt(job_id, d, report)
         self.store.mutate(job_id, lambda s: s["timings"].__setitem__("resolve_and_export", time.monotonic() - start))
         self.store.patch(job_id, stage="done", status="exported", pack_export=report, installation_complete=False,
-                         activity={"operation": "ready_for_prism_import"})
+                         activity={"operation": "ready_for_prism_import"}, installation_receipt=evidence)
 
     async def install(self, job_id, source):
         d = self.store.get(job_id)
@@ -582,6 +673,6 @@ class Engine:
         d = self.store.get(job_id)
         path = self.store.job_dir(job_id) / "report.json"
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
         return str(path)

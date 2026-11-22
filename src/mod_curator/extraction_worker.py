@@ -14,6 +14,7 @@ import time
 from .analysis_roles import DEFAULT_MODEL, MODELS
 from .facts import Facts, ReferenceResponse, referenced_prompt
 from .store import Store
+from .platform_support import background_options, codex_command
 
 
 def observe_session(thread_id):
@@ -23,7 +24,7 @@ def observe_session(thread_id):
         return {}
     for path in root.rglob('*'+thread_id+'.jsonl'):
         observed={}
-        with path.open() as stream:
+        with path.open(encoding="utf-8") as stream:
             for line in stream:
                 try:
                     row=json.loads(line)
@@ -43,7 +44,7 @@ def run_batch(store, batch, effort='medium', timeout=600):
         raise ValueError('Unsupported worker model, reasoning effort or role')
     facts=Facts(store);base=store.job_dir(batch['job_id'])/'extraction-runs';base.mkdir(exist_ok=True)
     run_dir=base/batch['batch_id'];run_dir.mkdir(exist_ok=True)
-    schema=run_dir/'schema.json';schema.write_text(json.dumps(ReferenceResponse.model_json_schema()))
+    schema=run_dir/'schema.json';schema.write_text(json.dumps(ReferenceResponse.model_json_schema()), encoding="utf-8")
     output=run_dir/'result.json';events=run_dir/'events.jsonl'
     prompt=referenced_prompt(batch)
     if role == 'retry':
@@ -53,13 +54,13 @@ def run_batch(store, batch, effort='medium', timeout=600):
     # New conversation, neutral working directory, no parent chat, user config,
     # project AGENTS, plugins or MCP servers. Auth remains in existing CODEX_HOME.
     with tempfile.TemporaryDirectory(prefix='curator-extract-') as temp:
-        args=['codex','exec','--ignore-user-config','--strict-config','--skip-git-repo-check','-C',temp,
+        args=[*codex_command(),'exec','--ignore-user-config','--strict-config','--skip-git-repo-check','-C',temp,
               '-m',model,'-c',f'model_reasoning_effort="{effort}"','-c','service_tier="default"',
               '--disable','apps','--disable','plugins','--disable','multi_agent','--enable','skip_host_skill_discovery','-s','read-only','--json','--output-schema',str(schema),'--output-last-message',str(output),'-']
         env={k:v for k,v in os.environ.items() if k not in ('OPENAI_API_KEY','CURSEFORGE_API_KEY')}
         start=time.monotonic()
         with events.open('w') as log,(run_dir/'stderr.log').open('w') as err:
-            proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=log,stderr=err,text=True,env=env,start_new_session=True)
+            proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=log,stderr=err,encoding="utf-8",env=env,**background_options())
             proc.stdin.write(prompt);proc.stdin.close()
             try:
                 while True:
@@ -77,7 +78,7 @@ def run_batch(store, batch, effort='medium', timeout=600):
                 raise
         elapsed=time.monotonic()-start
     usage={};thread_id=None;model_calls=0;tools=0
-    for line in events.read_text().splitlines():
+    for line in events.read_text(encoding="utf-8").splitlines():
         try:r=json.loads(line)
         except ValueError:continue
         if r.get('type')=='thread.started':thread_id=r.get('thread_id')
@@ -86,14 +87,14 @@ def run_batch(store, batch, effort='medium', timeout=600):
     observed=observe_session(thread_id)
     meta={'role':role,'requested_model':model,'requested_reasoning_effort':effort,'observed':observed,
           'usage':usage,'turns_reported':model_calls,'tool_calls':tools,'seconds':elapsed,'client':'codex exec child, existing Codex auth','fast':False}
-    (run_dir/'metrics.json').write_text(json.dumps(meta,indent=2))
+    (run_dir/'metrics.json').write_text(json.dumps(meta,indent=2), encoding="utf-8")
     if proc.returncode:
         raise RuntimeError(f'Codex worker {model} / {effort} failed ({proc.returncode}); inspect local stderr.log')
     if observed.get('model') != model or observed.get('reasoning_effort') != effort:
         actual = f"{observed.get('model', 'unknown')} / {observed.get('reasoning_effort', 'unknown')}"
         raise RuntimeError(f'MODEL_NOT_VERIFIED: requested {model} / {effort}, observed {actual}; facts not committed')
     # Envelope parse first, per-record validation/retry in commit.
-    obj=json.loads(output.read_text())
+    obj=json.loads(output.read_text(encoding="utf-8"))
     if not isinstance(obj,dict) or not isinstance(obj.get('records'),list):
         raise ValueError('Invalid facts response envelope')
     return facts.commit(batch['batch_id'],obj['records'],meta)
@@ -132,6 +133,6 @@ def launch(store,job_id,max_batches=1,effort='medium'):
     path=store.job_dir(job_id)/'extraction-worker.log'
     import sys
     with path.open('ab') as log:
-        p=subprocess.Popen([sys.executable,'-m','mod_curator','extract-worker',job_id,'--batches',str(max_batches),'--effort',effort],
-                           env={**os.environ,'MOD_CURATOR_HOME':str(store.root)},stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+        p=subprocess.Popen([sys.executable,'-X','utf8','-m','mod_curator','extract-worker',job_id,'--batches',str(max_batches),'--effort',effort],
+                           env={**os.environ,'MOD_CURATOR_HOME':str(store.root)},stdin=subprocess.DEVNULL,stdout=log,stderr=log,**background_options())
     return {'job_id':job_id,'worker_pid':p.pid,'max_batches':max_batches,'poll_after_seconds':60}

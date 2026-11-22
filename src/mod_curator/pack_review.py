@@ -1,6 +1,8 @@
 """Read-only explanations, local similarity and revision history."""
 from __future__ import annotations
 
+from . import captures
+
 import json
 from urllib.parse import parse_qs, urlparse
 
@@ -53,12 +55,12 @@ def find_project(store, job, revision, query, related=()):
                         excluded_categories=recorded.get('excludedCategories', [''])[0].split(',') if recorded.get('excludedCategories') else [],
                         search=recorded.get('search', [''])[0], minecraft=recorded.get('version', [data['minecraft']])[0],
                         page_size=int(recorded.get('pageSize', [data['page_size']])[0]))
-            path = store.root / 'jobs' / job['id'] / f"catalog-{page['number']}.html"
-            if not path.is_file():
+            path = captures.catalog_path(store.root / 'jobs' / job['id'], page)
+            if not captures.exists(path):
                 continue
             try:
-                evidence = parse_catalog(path.read_text(), page['url'], Filters.model_validate(data), page['number'])
-            except (ValueError, SourceError, OSError):
+                evidence = parse_catalog(captures.read(path), page['url'], Filters.model_validate(data), page['number'])
+            except (ValueError, SourceError, OSError, EOFError):
                 continue
             for card in evidence.cards:
                 if card['id'] in without_metadata:
@@ -77,6 +79,7 @@ def find_project(store, job, revision, query, related=()):
 
 
 def page_evidence(job, pid):
+    fallback = None
     for page in job['pages']:
         if pid in page['ids']:
             index = page['ids'].index(pid)
@@ -84,10 +87,16 @@ def page_evidence(job, pid):
             if index >= len(values) or type(values[index]) is not int:
                 continue
             accepted = page.get('accepted_ids')
-            return {'page': page['number'], 'position': index + 1, 'downloads': values[index], 'url': page.get('url'),
-                    'accepted': None if accepted is None else pid in accepted,
-                    'minimum_downloads': page.get('minimum_downloads', job['filters']['minimum_downloads'])}
-    return None
+            evidence = {'page': page['number'], 'position': index + 1, 'downloads': values[index], 'url': page.get('url'),
+                        'accepted': None if accepted is None else pid in accepted,
+                        'minimum_downloads': page.get('minimum_downloads', job['filters']['minimum_downloads'])}
+            if page.get('search_scope_index') is not None:
+                evidence['search_scope'] = job['search_scopes'][page['search_scope_index']]['label']
+            if evidence['accepted'] is not False:
+                return evidence
+            if fallback is None:
+                fallback = evidence
+    return fallback
 
 
 def why(store, job_id, query, revision=None, curseforge_only=False):
@@ -98,7 +107,8 @@ def why(store, job_id, query, revision=None, curseforge_only=False):
     related = (plan or {}).get('projects', {}).values()
     project, early = find_project(store, job, state, query.strip(), related)
     common = {'job_id': job_id, 'revision': revision, 'effective_filters': state['brief']['filters'],
-              'collection_reason': job.get('collection_reason'), 'collection_completeness': job['completeness']}
+              'collection_reason': job.get('collection_reason'), 'collection_completeness': job['completeness'],
+              'search_scopes': job.get('search_scopes', [])}
     if early:
         return {**common, **early}
     card = label(project)

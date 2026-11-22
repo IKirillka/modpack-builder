@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "minecraft-mod-curator",
-  "version": "0.7.0",
+  "version": "0.8.1",
   "description": "Persistent CurseForge curation and complete file/dependency manifests for Prism Launcher",
   "license": "MIT",
   "keywords": [

@@ -10,13 +10,15 @@ from .engine import Engine
 from .economy import Economy, SettingsPatch
 from .lifecycle import CleanupPatch, JobLifecycle, run_on_startup
 from .models import Decision, Filters
+from .modrinth import ExternalVersion
+from .plan_evidence import DependencyEvidence, Replacement
 
 
 def make_server(engine=None, port=8765):
     e = engine or Engine()
     lifecycle = JobLifecycle(e.store)
     run_on_startup(e.store)
-    instructions = files("mod_curator").joinpath("server_instructions.md").read_text()
+    instructions = files("mod_curator").joinpath("server_instructions.md").read_text(encoding="utf-8")
     mcp = FastMCP(DISPLAY_NAME, instructions=instructions,
                   host="127.0.0.1", port=port, stateless_http=True, json_response=True)
     read = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
@@ -36,7 +38,7 @@ def make_server(engine=None, port=8765):
 
     @mcp.tool(annotations=write)
     def start_collection(filters: Filters) -> dict[str, Any]:
-        """Start a detached code-controlled catalogue traversal, threshold filter and full description collection. Returns immediately."""
+        """Low-level scripted collection. For a new conversational pack, use pack_brief to resolve and save intake before starting."""
         return e.start(filters.model_dump())
 
     @mcp.tool(annotations=read)
@@ -114,9 +116,9 @@ def make_server(engine=None, port=8765):
         return e.cancel(job_id)
 
     @mcp.tool(annotations=write)
-    def resume_job(job_id: str) -> dict[str, Any]:
+    def resume_job(job_id: str, max_states: int | None = None) -> dict[str, Any]:
         """Resume failed, cancelled or interrupted work, retaining committed pages, descriptions, decisions and file lock."""
-        return e.resume(job_id)
+        return e.resume(job_id, max_states=max_states)
 
     @mcp.tool(annotations=read)
     def job_results(job_id: str, offset: int = 0, limit: int = 50) -> dict[str, Any]:
@@ -204,7 +206,7 @@ def make_server(engine=None, port=8765):
                     "installation_complete": d.get("installation_complete", False),
                     "prism_import_complete": d.get("prism_import_verification", {}).get("verified", False),
                     "pack_export": {k: export[k] for k in ("ready", "status", "path", "sha256", "files_count", "unresolved",
-                                                         "installation_plan_task") if k in export},
+                                                         "installation_plan_task", "receipt_path", "verification_stages") if k in export},
                     "locked_files": len(d.get("lock", {}).get("files", {})),
                     "latest_errors": d["errors"][-3:],
                     "local_report_path": str(e.store.root / "jobs" / job_id / "report.json")}
@@ -272,7 +274,7 @@ def make_server(engine=None, port=8765):
                    patch: BriefPatch | None = None, expected_revision: int | None = None,
                    copy_from_job: str | None = None, carry_manual: bool = False,
                    affected_ids: list[int] | None = None) -> dict[str, Any]:
-        """Persist adaptive intake answers. Show the ready brief before start. Use job to resume by ID, update for preferences or a technical coverage plan. Copy only on explicit user request."""
+        """Persist adaptive intake answers. Render next_questions, save each answer and start only when ready. Show exact search_scopes and the ready brief before start. Use job to resume by ID, update for preferences or a technical coverage plan. Copy only on explicit user request."""
         intake = Intake(e)
         if action == 'drafts':
             return {'items': intake.open()}
@@ -394,9 +396,12 @@ def make_server(engine=None, port=8765):
         report_path = e.store.root / 'jobs' / plan['task_id'] / 'installation-plan.json'
         report = str(report_path) if report_path.is_file() else None
         items = [{'kind': 'blocker', **p} for p in plan['blockers']] + [{'kind': 'warning', **p} for p in plan['warnings']]
-        items += [{'kind': 'file', 'project_id': int(pid), 'file_id': f['id'], 'name': f['fileName'],
-                   'required_dependencies': [d for d in f['dependencies'] if d['relationType'] == 3]}
-                  for pid, f in plan.get('lock', {}).get('files', {}).items()]
+        if 'items' in plan:
+            items += [{'kind': 'file', **item} for item in plan['items']]
+        else:
+            items += [{'kind': 'file', 'project_id': int(pid), 'file_id': f['id'], 'name': f['fileName'],
+                       'required_dependencies': [d for d in f['dependencies'] if d['relationType'] == 3]}
+                      for pid, f in plan.get('lock', {}).get('files', {}).items()]
         return {**summary(plan, report), 'total': len(items), 'offset': offset, 'items': items[offset:offset + limit]}
 
     @mcp.tool(annotations=write)
@@ -406,13 +411,15 @@ def make_server(engine=None, port=8765):
                    project_ids: list[int] | None = None, file_ids: dict[str, int] | None = None,
                    proposal_id: str | None = None, override_file_pins: bool = False,
                    candidate_review_job_id: str | None = None,
-                   relationships: list[Relationship] | None = None) -> dict[str, Any]:
+                   relationships: list[Relationship] | None = None, user_request: str | None = None,
+                   max_states: int = 100_000, jar_alias: str | None = None) -> dict[str, Any]:
         """Start a detached preflight, file rollback, update scan or validated application of exact proposals. Never exports, downloads JARs or opens Prism."""
         from . import updates
         from .pack_review import rollback, record_relationships
         from .preflight import schedule
         if action == 'preflight':
-            return schedule(e, job_id, revision, loader_version, curseforge_only)
+            return schedule(e, job_id, revision, loader_version, curseforge_only,
+                            user_request=user_request, max_states=max_states, jar_alias=jar_alias)
         if action == 'updates':
             return updates.propose(e, job_id, revision, catalogue_pages, include_files, project_ids, curseforge_only)
         if revision is None:
@@ -430,11 +437,31 @@ def make_server(engine=None, port=8765):
         return updates.apply_proposals(e, job_id, revision, proposal_id, project_ids or [], file_ids or {},
                                        override_file_pins, candidate_review_job_id)
 
+    @mcp.tool(annotations=write)
+    def pack_plan_sources(job_id: str, revision: int, external: list[ExternalVersion] | None = None,
+                          evidence: list[DependencyEvidence] | None = None,
+                          replacements: list[Replacement] | None = None) -> dict[str, Any]:
+        """Save explicitly requested exact external files, evidence and replacements in a new revision.
+        Each provided list replaces that field. Preserve absent fields. Confirm platform overrides with the user."""
+        return Composition(e).plan_sources(job_id, revision, external=external, evidence=evidence,
+                                           replacements=replacements)
+
+    @mcp.tool(annotations=write)
+    def verify_prism_export(export_job_id: str, instance_alias: str) -> dict[str, Any]:
+        """Read and compare an explicitly registered local instance. Save the full receipt outside chat."""
+        from .verification import audit_prism
+        snapshot = audit_prism(e.store, export_job_id, e.store.destination(instance_alias))
+        inventory = snapshot['inventory']
+        return {key: snapshot[key] for key in ('verified', 'errors', 'report_path', 'receipt_path', 'verification_stages')} | {
+            'counts': {key: len(value) if isinstance(value, list) else value for key, value in inventory.items()}}
+
     @mcp.tool(annotations=read)
     def pack_check_result(task_id: str, offset: int = 0, limit: int = 20) -> dict[str, Any]:
         """Read concise preflight/rollback results or page through update proposals. Poll background state with job_status."""
         from .updates import report
         task = e.store.get(task_id)
+        if task['stage'] == 'pack_check' and task['status'] in ('running', 'queued', 'cancelled') and not task.get('update_report'):
+            return {'status': task['status'], 'activity': task.get('activity'), 'current_report': task.get('check_report_path')}
         if task.get('check_summary'):
             return {'status': task['status'], **task['check_summary'],
                     'applied': task.get('check_plan', {}).get('applied')}

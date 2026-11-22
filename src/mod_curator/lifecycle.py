@@ -386,7 +386,7 @@ class JobLifecycle:
             db.execute("BEGIN IMMEDIATE")
             for table in ("economy_claims", "economy_projects"):
                 db.execute(f"DELETE FROM {table} WHERE run_id IN (SELECT id FROM economy_runs WHERE job_id=?)", (job_id,))
-            for table in ("economy_runs", "fact_queue", "fact_batches", "fact_selections", "installation_plans", "job_usage"):
+            for table in ("economy_runs", "fact_queue", "fact_batches", "fact_selections", "installation_plans", "preflight_cache", "installation_snapshots", "job_usage"):
                 db.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
             db.execute("DELETE FROM intake_drafts WHERE json_extract(data,'$.job_id')=?", (job_id,))
             db.execute("DELETE FROM job_trash WHERE id=?", (job_id,))

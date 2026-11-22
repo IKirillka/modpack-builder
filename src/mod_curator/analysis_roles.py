@@ -64,7 +64,7 @@ def model_options():
     """A local catalogue hint. Credentials and catalogue instructions are never returned."""
     location = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) / 'models_cache.json'
     try:
-        entries = json.loads(location.read_text())['models']
+        entries = json.loads(location.read_text(encoding="utf-8"))['models']
         listed = {entry['slug'] for entry in entries if entry.get('visibility') == 'list'}
     except (OSError, ValueError, TypeError, KeyError):
         listed = None

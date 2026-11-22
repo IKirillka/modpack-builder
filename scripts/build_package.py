@@ -12,14 +12,14 @@ import tomllib
 import jsonschema
 
 root = Path(__file__).resolve().parents[1]
-version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 for name in ("plugin", "mcp"):
-    jsonschema.validate(json.loads((root / f"{name}.json").read_text()),
-                        json.loads((root / f"evidence/{name}.schema.json").read_text()))
-instructions = (root / "src/mod_curator/instructions.md").read_text()
+    jsonschema.validate(json.loads((root / f"{name}.json").read_text(encoding="utf-8")),
+                        json.loads((root / f"evidence/{name}.schema.json").read_text(encoding="utf-8")))
+instructions = (root / "src/mod_curator/instructions.md").read_text(encoding="utf-8")
 skill = "---\nname: curate-minecraft-mods\ndescription: Modpack Builder finds and analyzes real CurseForge catalogue mods, revise selections and export complete manifests for Prism Launcher through local MCP. Use for creating or correcting a Minecraft mod pack.\n---\n\n" + instructions
 (root / "skills/curate-minecraft-mods").mkdir(parents=True, exist_ok=True)
-(root / "skills/curate-minecraft-mods/SKILL.md").write_text(skill)
+(root / "skills/curate-minecraft-mods/SKILL.md").write_text(skill, encoding="utf-8")
 if "--package-only" not in sys.argv:
     subprocess.run([sys.executable, "-m", "build", "--wheel", "--no-isolation"], cwd=root, check=True)
 (root / "vendor").mkdir(exist_ok=True)
@@ -34,7 +34,8 @@ include_files = (
     "plugin.json", "mcp.json", ".mcp.json", "pyproject.toml", "README.md", "LICENSE",
     ".gitignore", "requirements.lock.txt", ".agents/plugins/marketplace.json",
     ".codex-plugin/plugin.json", "skills/curate-minecraft-mods/SKILL.md",
-    "docs/INSTALL.md", "docs/JOB_CLEANUP.md", "docs/MCP.md", "examples/filters.json",
+    "docs/INSTALL.md", "docs/WINDOWS.md", "docs/AUDIT_WINDOWS.md", "docs/P0_WINDOWS_TRIAL.md",
+    "docs/P0_VALIDATION.md", "docs/BACKLOG_WINDOWS_AUDIT.md", "docs/JOB_CLEANUP.md", "docs/MCP.md", "examples/filters.json",
     "evidence/plugin.schema.json", "evidence/mcp.schema.json", f"vendor/{wheel.name}",
 )
 paths = [root / p for p in include_files]

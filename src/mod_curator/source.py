@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -13,10 +14,11 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from . import __version__
+from . import __version__, captures
 from .models import Filters, LOADERS, SourceError
 
 BASE = "https://www.curseforge.com"
+PROJECT_SLUG = re.compile(r"[a-z0-9_-]+")
 SORT = "total downloads"
 
 
@@ -96,6 +98,24 @@ def files_and_pagination(payload):
     return candidates[0]
 
 
+def check_file_page(paging, count, page, size, known_total, modes):
+    """Check both offset and one/zero-based page indices across the whole table."""
+    total, index = paging.get("totalCount"), paging.get("index")
+    offset = (page - 1) * size
+    expected = {"offset": offset, "page": page, "zero_based_page": page - 1}
+    if type(total) is not int or total < 0 or type(index) is not int:
+        raise SourceError("FILE_PAGINATION_INVALID: missing or invalid counters")
+    if known_total is not None and known_total != total:
+        raise SourceError("FILE_PAGINATION_CHANGED: total changed")
+    modes.intersection_update(name for name, value in expected.items() if value == index)
+    if not modes or offset > total or count != min(size, total - offset):
+        raise SourceError("FILE_PAGINATION_INCOMPLETE: count/index mismatch")
+    return total
+
+
+def source_page_error(exc, url, page):
+    return SourceError(f"{exc} [page {page}: {url}]")
+
 def parse_catalog(html: str, final_url: str, filters: Filters, number: int) -> Page:
     soup = BeautifulSoup(html, "html.parser")
     if soup.title and any(x in soup.title.get_text().lower() for x in ("just a moment", "access denied")):
@@ -158,8 +178,9 @@ def parse_catalog(html: str, final_url: str, filters: Filters, number: int) -> P
         # No float, K/M conversion or assumed zero at the threshold.
         if type(n) is not int or n < 0:
             raise SourceError(f"UNKNOWN_DOWNLOADS: project {p.get('id')}")
-        if type(p.get("id")) is not int or p["id"] <= 0 or not re.fullmatch(r"[a-z0-9-]+", p.get("slug", "")):
-            raise SourceError("SCHEMA_CHANGED: invalid project identity")
+        slug = p.get("slug")
+        if type(p.get("id")) is not int or p["id"] <= 0 or not isinstance(slug, str) or not PROJECT_SLUG.fullmatch(slug):
+            raise SourceError(f"SCHEMA_CHANGED: invalid project identity on page {number}, position {pos}")
         cards.append(dict(id=p["id"], name=p["name"], slug=p["slug"],
                           url=f"{BASE}/minecraft/mc-mods/{p['slug']}", downloads=n,
                           page=number, position=pos, summary=p.get("summary", "")))
@@ -183,6 +204,7 @@ class CurseForge:
         self.gate = asyncio.Semaphore(3)
         self.known_projects = {}
         self.file_cache = {}
+        self.network_seconds = 0.0
 
     def seed_projects(self, projects):
         self.known_projects.update({int(k): v for k, v in projects.items()})
@@ -191,7 +213,7 @@ class CurseForge:
         if obj.get("gameId", 432) != 432 or obj.get("classCategory", {}).get("id", 6) != 6:
             raise SourceError("NOT_A_MINECRAFT_MOD")
         pid, slug = obj["id"], obj["slug"]
-        if type(pid) is not int or not re.fullmatch(r"[a-z0-9-]+", slug):
+        if type(pid) is not int or pid <= 0 or not isinstance(slug, str) or not PROJECT_SLUG.fullmatch(slug):
             raise SourceError("INVALID_PROJECT_IDENTITY")
         p = dict(id=pid, name=obj["name"], slug=slug, url=f"{BASE}/minecraft/mc-mods/{slug}",
                  downloads=obj.get("downloads"), metadata_source="website")
@@ -209,6 +231,13 @@ class CurseForge:
         return obj
 
     async def request(self, url, *, api=False, params=None):
+        started = time.monotonic()
+        try:
+            return await self._request(url, api=api, params=params)
+        finally:
+            self.network_seconds += time.monotonic() - started
+
+    async def _request(self, url, *, api=False, params=None):
         headers = {"x-api-key": self.api_key} if api and self.api_key else {}
         if api and not self.api_key:
             raise SourceError("API_KEY_REQUIRED: set CURSEFORGE_API_KEY locally; catalogue never uses API search")
@@ -218,6 +247,8 @@ class CurseForge:
                 r = await self.client.get(url, headers=headers, params=params)
                 if r.status_code == 403:
                     raise SourceError("SITE_BLOCKED: HTTP 403 from CurseForge" if not api else "API_DENIED: invalid key or permissions")
+                if r.status_code == 404:
+                    raise SourceError(f"SOURCE_HTTP_404: {url}")
                 if r.status_code == 429 or r.status_code >= 500:
                     delay = min(30, max(1, float(r.headers.get("retry-after", 2 ** attempt))))
                     await asyncio.sleep(delay)
@@ -236,15 +267,27 @@ class CurseForge:
         if self.config.get("transport") not in ("browser", "cdp"):
             r = await self.request(url)
             return r.text, str(r.url)
+        started = time.monotonic()
+        try:
+            return await self._browser_html(url)
+        finally:
+            self.network_seconds += time.monotonic() - started
+
+    async def _browser_html(self, url):
         async with self.browser_gate:
             if not self.browser:
-                from playwright.async_api import async_playwright
-                self.playwright = await async_playwright().start()
+                from playwright.async_api import Error as BrowserError, async_playwright
+                if self.playwright is None:
+                    self.playwright = await async_playwright().start()
                 if self.config.get("transport") == "cdp":
                     address = self.config.get("cdp_url", "http://127.0.0.1:9222")
                     if urlparse(address).hostname not in ("127.0.0.1", "localhost", "::1"):
                         raise SourceError("CDP_MUST_BE_LOCAL: configure a loopback browser endpoint locally")
-                    self.remote_browser = await self.playwright.chromium.connect_over_cdp(address)
+                    try:
+                        self.remote_browser = await self.playwright.chromium.connect_over_cdp(address, timeout=10000)
+                    except BrowserError as exc:
+                        raise SourceError("CDP_UNAVAILABLE: start the local browser with scripts/start_browser.py "
+                                          "and resume the existing job") from exc
                     if not self.remote_browser.contexts:
                         raise SourceError("CDP_NO_BROWSER_CONTEXT")
                     self.browser = self.remote_browser.contexts[0]
@@ -276,7 +319,7 @@ class CurseForge:
             try:
                 html, url = await self.html(catalog_url(filters, number))
                 if self.evidence_dir:
-                    (self.evidence_dir / f"catalog-{number}.html").write_text(html)
+                    captures.write(self.evidence_dir / f"catalog-{number}.html", html)
                 page = parse_catalog(html, url, filters, number)
                 self.seed_projects({p["id"]: p for p in page.cards})
                 return page
@@ -321,7 +364,7 @@ class CurseForge:
             else:
                 html, _ = await self.html(project["url"])
                 if self.evidence_dir:
-                    (self.evidence_dir / f"description-{project['id']}.html").write_text(html)
+                    captures.write(self.evidence_dir / f"description-{project['id']}.html", html)
                 soup = BeautifulSoup(html, "html.parser")
                 desc = soup.select_one(".project-description")
                 if not desc:
@@ -357,7 +400,12 @@ class CurseForge:
     async def exact_file(self, project_id, file_id, filters):
         """Fetch fresh evidence for a pinned file without expanding older file pages."""
         if self.api_key:
-            file = (await self.api(f"mods/{project_id}/files/{file_id}"))["data"]
+            try:
+                file = (await self.api(f"mods/{project_id}/files/{file_id}"))["data"]
+            except SourceError as exc:
+                if str(exc).startswith("SOURCE_HTTP_404:"):
+                    return None
+                raise
             return file if file.get("id") == file_id else None
         files = await self.website_files(project_id, filters, until_file=file_id)
         if files and files[0]["isAvailable"]:
@@ -378,32 +426,31 @@ class CurseForge:
     async def website_files(self, pid, filters, *, until_file=None):
         project = await self.project(pid)
         page, all_files, seen, expected_total = 1, [], set(), None
+        modes = {"offset", "page", "zero_based_page"}
         while True:
             params = {"page": page, "pageSize": 20, "version": filters.minecraft,
                       "gameVersionTypeId": LOADERS[filters.loader][0], "showAlphaFiles": "show" if (3 in filters.release_types if filters.release_types is not None else filters.allow_prerelease) else "hide",
                       "sortBy": "dateCreated", "sortOrder": "desc"}
             url = project["url"] + "/files/all?" + urlencode(params)
-            html, final = await self.html(url)
-            expected = urlparse(url)
-            actual = urlparse(final)
-            if (actual.scheme, actual.netloc, actual.path) != (expected.scheme, expected.netloc, expected.path) or any(parse_qs(actual.query).get(key) != value
-                                                   for key, value in parse_qs(expected.query).items()):
-                raise SourceError("FILE_LIST_FILTER_MISMATCH")
-            t = flight_text(BeautifulSoup(html, "html.parser"))
-            self.website_project(html, pid, payload=t)
-            batch, paging = files_and_pagination(t)
-            total = paging["totalCount"]
-            if expected_total is not None and total != expected_total:
-                raise SourceError("FILE_LIST_CHANGED: resume after source stabilizes")
-            expected_total = total
-            if paging["index"] != (page - 1) * 20 or len(batch) != min(20, max(0, total - paging["index"])):
-                raise SourceError("FILE_LIST_INCOMPLETE: count/index mismatch")
-            for item in batch:
-                if item["id"] in seen:
-                    raise SourceError("FILE_LIST_DUPLICATE: pagination changed")
-                seen.add(item["id"])
-                if until_file is None or item["id"] == until_file:
-                    all_files.append(self.normalize_file(item, pid, project["slug"]))
+            try:
+                html, final = await self.html(url)
+                expected = urlparse(url)
+                actual = urlparse(final)
+                if (actual.scheme, actual.netloc, actual.path) != (expected.scheme, expected.netloc, expected.path) or any(parse_qs(actual.query).get(key) != value
+                                                       for key, value in parse_qs(expected.query).items()):
+                    raise SourceError("FILE_LIST_FILTER_MISMATCH")
+                t = flight_text(BeautifulSoup(html, "html.parser"))
+                self.website_project(html, pid, payload=t)
+                batch, paging = files_and_pagination(t)
+                total = expected_total = check_file_page(paging, len(batch), page, 20, expected_total, modes)
+                for item in batch:
+                    if item["id"] in seen:
+                        raise SourceError("FILE_LIST_DUPLICATE: pagination changed")
+                    seen.add(item["id"])
+                    if until_file is None or item["id"] == until_file:
+                        all_files.append(self.normalize_file(item, pid, project["slug"]))
+            except (SourceError, KeyError, ValueError, TypeError) as exc:
+                raise source_page_error(exc, url, page) from exc
             if until_file is not None and all_files:
                 return all_files
             if len(seen) >= total:
@@ -418,46 +465,51 @@ class CurseForge:
         if key in self.file_cache and not fresh:
             return self.file_cache[key]
         deps, page, seen, expected_total, detail = [], 1, set(), None, None
+        modes = {"offset", "page", "zero_based_page"}
+        page_size = None
         types = {"EmbeddedLibrary": 1, "OptionalDependency": 2, "RequiredDependency": 3,
                  "Tool": 4, "Incompatible": 5, "Include": 6}
         while True:
             url = f"{BASE}/minecraft/mc-mods/{slug}/files/{fid}/dependencies?page={page}"
-            html, final = await self.html(url)
-            parsed = urlparse(final)
-            if (parsed.scheme != "https" or parsed.netloc != "www.curseforge.com"
-                    or parsed.path != f"/minecraft/mc-mods/{slug}/files/{fid}/dependencies"):
-                raise SourceError("FILE_RELATIONS_REDIRECTED: cannot verify dependencies for the requested file")
-            t = flight_text(BeautifulSoup(html, "html.parser"))
-            self.website_project(html, pid, payload=t)
-            actual = next((v for v in embedded_value(t, "file") if isinstance(v, dict) and v.get("id") == fid), None)
-            relations = next((v for v in embedded_value(t, "relations") if isinstance(v, dict) and "data" in v and "pagination" in v), None)
-            if actual is None or relations is None:
-                raise SourceError("FILE_DEPENDENCIES_UNKNOWN: explicit file relations missing; do not assume empty")
-            detail = self.normalize_file(actual, pid, slug)
-            paging, batch = relations["pagination"], relations["data"]
-            total = paging["totalCount"]
-            if expected_total is not None and expected_total != total:
-                raise SourceError("FILE_RELATIONS_CHANGED")
-            expected_total = total
-            if paging["index"] != (page - 1) * paging["pageSize"] or len(batch) != min(paging["pageSize"], max(0, total - paging["index"])):
-                raise SourceError("FILE_RELATIONS_INCOMPLETE")
-            for item in batch:
-                if item["type"] not in types or (item["id"], item["type"]) in seen:
-                    raise SourceError("FILE_RELATIONS_UNKNOWN_OR_DUPLICATE")
-                seen.add((item["id"], item["type"]))
-                self.remember_project(item)
-                dep = {"modId": item["id"], "relationType": types[item["type"]]}
-                for field in ("fileId", "versionRange", "versionConstraint"):
-                    if item.get(field):
-                        dep[field] = item[field]
-                deps.append(dep)
+            try:
+                html, final = await self.html(url)
+                parsed = urlparse(final)
+                if (parsed.scheme != "https" or parsed.netloc != "www.curseforge.com"
+                        or parsed.path != f"/minecraft/mc-mods/{slug}/files/{fid}/dependencies"
+                        or parse_qs(parsed.query).get("page", ["1"]) != [str(page)]):
+                    raise SourceError("FILE_RELATIONS_REDIRECTED: cannot verify dependencies for the requested file")
+                t = flight_text(BeautifulSoup(html, "html.parser"))
+                self.website_project(html, pid, payload=t)
+                actual = next((v for v in embedded_value(t, "file") if isinstance(v, dict) and v.get("id") == fid), None)
+                relations = next((v for v in embedded_value(t, "relations") if isinstance(v, dict) and "data" in v and "pagination" in v), None)
+                if actual is None or relations is None:
+                    raise SourceError("FILE_DEPENDENCIES_UNKNOWN: explicit file relations missing; do not assume empty")
+                detail = self.normalize_file(actual, pid, slug)
+                paging, batch = relations["pagination"], relations["data"]
+                size = paging["pageSize"]
+                if type(size) is not int or size < 1 or (page_size is not None and size != page_size):
+                    raise SourceError("FILE_RELATIONS_INCOMPLETE: invalid or changed page size")
+                page_size = size
+                total = expected_total = check_file_page(paging, len(batch), page, size, expected_total, modes)
+                for item in batch:
+                    if item["type"] not in types or (item["id"], item["type"]) in seen:
+                        raise SourceError("FILE_RELATIONS_UNKNOWN_OR_DUPLICATE")
+                    seen.add((item["id"], item["type"]))
+                    self.remember_project(item)
+                    dep = {"modId": item["id"], "relationType": types[item["type"]]}
+                    for field in ("fileId", "versionRange", "versionConstraint"):
+                        if item.get(field):
+                            dep[field] = item[field]
+                    deps.append(dep)
+            except (SourceError, KeyError, ValueError, TypeError) as exc:
+                raise source_page_error(exc, url, page) from exc
             if len(seen) >= total:
                 break
             page += 1
-        detail.update(dependencies=deps, _details_complete=True, _dependencies_source=url)
+        detail.update(dependencies=deps, _details_complete=True, _dependencies_source=url.rsplit("=", 1)[0] + "1")
         self.file_cache[key] = detail
         if self.evidence_dir:
-            (self.evidence_dir / f"file-{pid}-{fid}.json").write_text(json.dumps(detail, indent=2))
+            (self.evidence_dir / f"file-{pid}-{fid}.json").write_text(json.dumps(detail, indent=2), encoding="utf-8")
         return detail
 
     async def close(self):

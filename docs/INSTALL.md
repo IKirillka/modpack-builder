@@ -1,17 +1,15 @@
 # Установка Modpack Builder
 
-Проверяемый путь — локальная установка на Linux. Нужны Python 3.11 или новее с модулем `venv`, Bash, доступ в интернет для установки Python-зависимостей и Codex с поддержкой локальных плагинов. Для работы с каталогом нужен Chrome или Chromium. Prism Launcher нужен для импорта готового ZIP.
+На Windows следуйте [инструкции для PowerShell](WINDOWS.md). Ниже приведена установка на Linux. Нужны Python 3.11 или новее с модулем `venv`, Bash, доступ в интернет для установки Python-зависимостей и Codex с поддержкой локальных плагинов. Для работы с каталогом нужен Chrome или Chromium. Prism Launcher нужен для импорта готового ZIP.
 
 ## 1. Получите файлы
 
-Войдите в GitHub под аккаунтом, у которого есть доступ к репозиторию. Скачайте файл `minecraft-mod-curator-0.7.0-plugin.zip` со страницы [выпуска 0.7.0](https://github.com/IKirillka/modpack-builder/releases/tag/v0.7.0), распакуйте его и откройте терминал в папке `minecraft-mod-curator`. Если Git уже настроен для доступа к этому приватному репозиторию, можно установить плагин из исходников.
+Скачайте `minecraft-mod-curator-0.8.1-plugin.zip` со страницы [выпуска 0.8.1](https://github.com/IKirillka/modpack-builder/releases/tag/v0.8.1). Распакуйте его и откройте терминал в папке `minecraft-mod-curator`. Для установки из исходников клонируйте репозиторий.
 
 ```bash
 git clone https://github.com/IKirillka/modpack-builder.git
 cd modpack-builder
 ```
-
-Если используете GitHub CLI, выполните `gh auth login`, а затем `gh repo clone IKirillka/modpack-builder` и `cd modpack-builder`.
 
 ## 2. Установите локальный компонент
 

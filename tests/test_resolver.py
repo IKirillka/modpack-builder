@@ -44,3 +44,29 @@ async def test_removal_recalculates_dependencies(filters):
     source = FakeSource(files={1: [file(1, [3])], 2: [file(2, [4])], 3: [file(3)], 4: [file(4)]})
     assert set((await resolve(source, [1, 2], filters))["files"]) == {"1", "2", "3", "4"}
     assert set((await resolve(source, [1], filters))["files"]) == {"1", "3"}
+
+
+@pytest.mark.parametrize("last", ["missing", "missing-pin", "unavailable"])
+async def test_impossible_root_does_not_enumerate_independent_file_choices(filters, last):
+    from mod_curator.resolver import ResolutionError
+
+    seen = 0
+
+    def count_check():
+        nonlocal seen
+        seen += 1
+        assert seen < 30, "An impossible root should stop the search"
+
+    class Source(FakeSource):
+        async def files(self, pid, filters):
+            if pid == 9 and last == "unavailable":
+                raise SourceError("SITE_BLOCKED")
+            return await super().files(pid, filters)
+
+    data = {i: [file(i, fid=100 * i + j) for j in range(3)] for i in range(1, 9)}
+    pins = {9: 901} if last == "missing-pin" else {}
+    if pins:
+        data[9] = [file(9, fid=900)]
+    with pytest.raises(ResolutionError) as exc:
+        await resolve(Source(files=data), list(range(1, 10)), filters, count_check, pins=pins)
+    assert exc.value.issues[-1]["project_id"] == 9

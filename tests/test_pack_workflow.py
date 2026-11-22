@@ -24,13 +24,15 @@ async def test_vague_draft_restart_then_start_preserves_each_answer(engine):
     intake = Intake(engine)
     draft = intake.save(BriefPatch())
     assert 'concept' in draft['missing'] and not engine.store.jobs()
+    assert [item['fields'] for item in draft['next_questions']] == [['concept']]
     draft = intake.save(BriefPatch(concept='Factories', preferences={'decor': 'only structural'}), draft['draft_id'], expected_revision=1)
     fresh = Engine(Store(engine.store.root))
     fresh.launch = engine.launch
     intake = Intake(fresh)
     assert intake.open(draft['draft_id'])['brief']['preferences']['decor'] == 'only structural'
-    draft = intake.save(BriefPatch(filters={'minecraft':'1.21.1','loader':'NeoForge','minimum_downloads':50, 'release_types':[1,2]},
-                                   agent_choices={'minimum_downloads':'keep rare projects'}, required_ids=[1]), draft['draft_id'], expected_revision=2)
+    draft = intake.save(BriefPatch(filters={'minecraft':'1.21.1','loader':'NeoForge','categories':['create'], 'minimum_downloads':50, 'release_types':[1,2]},
+                                   agent_choices={'minimum_downloads':'keep rare projects'}, required_ids=[1], excluded_ids=[],
+                                   delegated_defaults=['extras','alternative_criteria']), draft['draft_id'], expected_revision=2)
     assert draft['ready'] and draft['effective_filters']['destination'] == 'mods'
     with pytest.raises(ValueError, match='stale'):
         intake.start(draft['draft_id'], 2)
@@ -46,8 +48,9 @@ async def test_vague_draft_restart_then_start_preserves_each_answer(engine):
 
 def test_detailed_brief_single_missing_field_and_explicit_copy(engine, filters):
     intake = Intake(engine)
-    config = filters.model_dump(exclude={'wishes', 'loader'})
-    draft = intake.save(BriefPatch(concept='Factory', filters=config, alternative_criteria='Functions before downloads', reserve=True))
+    config = {**filters.model_dump(exclude={'wishes', 'loader'}), 'categories': ['create']}
+    draft = intake.save(BriefPatch(concept='Factory', filters=config, alternative_criteria='Functions before downloads', reserve=True,
+                                   required_ids=[], excluded_ids=[], delegated_defaults=['extras']))
     assert draft['missing'] == ['loader']
     draft = intake.save(BriefPatch(filters={'loader':'NeoForge'}, required_ids=[123]),draft['draft_id'],expected_revision=1)
     jid = intake.start(draft['draft_id'], 2)['job_id']
@@ -97,7 +100,8 @@ async def test_preferences_and_technical_plan_reuse_existing_data(engine, filter
     assert plan['catalogue_plan']['mode'] == 'new_query' and engine.store.get(job) == changed
     plan = edit.update_brief(job, BriefPatch(filters={'minimum_downloads':1}), r['revision'])
     assert plan['catalogue_plan']['mode'] == 'saved_pages'
-    child = Intake(engine).save(BriefPatch(filters={'minimum_downloads':1}), copy_from_job=job)
+    child = Intake(engine).save(BriefPatch(filters={'minimum_downloads':1}, all_categories=True,
+                                          delegated_defaults=['constraints','extras','alternative_criteria']), copy_from_job=job)
     child_id = Intake(engine).start(child['draft_id'], child['revision'])['job_id']
     source = FakeSource([[(1, 9000),(6,3000)]])
     await engine.run(child_id, source)
@@ -143,3 +147,89 @@ async def test_separate_prism_import_uses_only_recorded_archive(engine, filters,
     with pytest.raises(ValueError, match='checksum'):
         open_prism_import(engine.store, job)
     assert len(calls) == 1
+
+
+def test_intake_distinguishes_unanswered_questions_from_authorized_defaults(engine):
+    intake = Intake(engine)
+    received = intake.save(BriefPatch(concept='Create + Aeronautics', filters={
+        'minecraft': '1.21.1', 'loader': 'NeoForge', 'categories': [], 'minimum_downloads': 1000
+    }, required_ids=[328085], extras={'decoration': 'skip'}))
+    assert not received['ready']
+    assert received['missing'] == ['search_scope', 'release_types', 'constraints', 'extras', 'alternative_criteria']
+    assert [q['fields'] for q in received['next_questions']] == [['search_scope'], ['release_types']]
+    with pytest.raises(ValueError, match='search_scope'):
+        intake.start(received['draft_id'], received['revision'])
+    assert not engine.store.jobs()
+
+    amended = intake.save(BriefPatch(filters={'categories': ['create']},
+                                     delegated_defaults=['release_types', 'constraints', 'extras', 'alternative_criteria'],
+                                     unresolved={'threshold': '«До 1 000» — верхняя граница или остановиться на пороге?'}),
+                          received['draft_id'], expected_revision=received['revision'])
+    assert not amended['ready'] and amended['next_questions'][0]['fields'] == ['threshold']
+    done = intake.save(BriefPatch(unresolved={'threshold': ''}), amended['draft_id'], expected_revision=amended['revision'])
+    assert done['ready'] and done['next_questions'] == []
+    assert done['brief']['required_ids'] == [328085]
+    assert done['brief']['extras']['decoration'] == 'skip'
+    assert done['effective_filters']['release_types'] == [1]
+    assert done['brief']['agent_choices']['alternative_criteria']
+    assert 'decoration' not in done['brief']['agent_choices']
+
+
+async def test_independent_thresholds_resume_and_preserve_one_union(engine):
+    from mod_curator.models import SourceError
+    from mod_curator.pack_review import page_evidence
+    from mod_curator.verification import audit_collection
+    from mod_curator import captures
+    from test_source import html as website_html
+
+    intake = Intake(engine)
+    draft = intake.save(BriefPatch(concept='Create factories + optimization',
+        filters={'minecraft': '1.21.1', 'loader': 'NeoForge', 'release_types': [1, 2]},
+        search_scopes=[{'label': 'Create', 'categories': ['create'], 'minimum_downloads': 1000},
+                       {'label': 'Performance', 'categories': ['performance'], 'minimum_downloads': 50000}],
+        required_ids=[], excluded_ids=[5], extras={'decoration':'skip', 'quality_of_life':'allow', 'performance':'prefer'},
+        alternative_criteria='Choose downloads only at equal function', reserve=True))
+    assert draft['ready'] and 'minimum_downloads' not in draft['effective_filters']
+    job = intake.start(draft['draft_id'], draft['revision'])['job_id']
+
+    class TwoScopes(FakeSource):
+        def __init__(self, interrupted=False):
+            super().__init__()
+            self.interrupted = interrupted
+
+        async def page(self, f, number):
+            from mod_curator.source import Page, catalog_url
+            from conftest import card
+            category = f.categories[0]
+            self.calls.append((category, f.minimum_downloads, number))
+            if category == 'performance' and self.interrupted:
+                raise SourceError('SITE_BLOCKED')
+            cards = [(2, 75000), (3, 1001), (1, 1000)] if category == 'create' else [(2, 75000), (5, 60000), (4, 50000)]
+            records = [card(pid, downloads, number, pos) for pos, (pid, downloads) in enumerate(cards, 1)]
+            # Real parser shape verified in audit with a checked category.
+            blocks = [{'id': c['id'], 'name': c['name'], 'slug': c['slug'], 'downloadsCount': c['downloads']} for c in records]
+            out = website_html(blocks, category=category)
+            index = 0 if category == 'create' else 1
+            evidence = engine.store.job_dir(job) / f'search-{index+1}'
+            evidence.mkdir(exist_ok=True)
+            captures.write(evidence / 'catalog-1.html', out)
+            return Page(records, False, len(records), catalog_url(f, number))
+
+    first = TwoScopes(interrupted=True)
+    await engine.run(job, first)
+    pending = engine.store.get(job)
+    assert pending['status'] == 'error' and pending['search_scope_index'] == 1
+    assert not first.describe_calls
+    engine.resume(job)
+    second = TwoScopes()
+    await engine.run(job, second)
+    assert second.calls == [('performance', 50000, 1)]
+    saved = engine.store.get(job)
+    assert saved['order'] == [2, 3, 5] and sorted(second.describe_calls) == [2, 3, 5]
+    assert list(saved['projects']['2']['search_matches']) == ['Create', 'Performance']
+    assert saved['composition']['excluded']['5']['reason'] == 'Задано в ТЗ'
+    assert page_evidence(saved, 4)['search_scope'] == 'Performance'
+    assert page_evidence(saved, 4)['minimum_downloads'] == 50000
+    report = audit_collection(engine.store, job)
+    assert report['no_omissions_in_captured_pages'] and report['collected_projects'] == 3
+    assert len(report['search_scopes']) == 2

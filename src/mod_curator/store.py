@@ -32,6 +32,12 @@ class Store:
                       job_id TEXT NOT NULL, revision INTEGER NOT NULL, curseforge_only INTEGER NOT NULL,
                       ready INTEGER NOT NULL, data TEXT NOT NULL)""")
             c.execute("CREATE INDEX IF NOT EXISTS plans_by_revision ON installation_plans (job_id,revision,curseforge_only)")
+            c.execute("""CREATE TABLE IF NOT EXISTS preflight_cache (
+                      job_id TEXT NOT NULL, scope TEXT NOT NULL, item TEXT NOT NULL,
+                      captured REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(job_id,scope,item))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS installation_snapshots (
+                      job_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, captured REAL NOT NULL, data TEXT NOT NULL,
+                      PRIMARY KEY(job_id,snapshot_id))""")
             from .lifecycle import migrate as migrate_lifecycle
             migrate_lifecycle(c)
 
@@ -115,7 +121,7 @@ class Store:
 
     def config(self):
         p = self.root / "config.json"
-        return json.loads(p.read_text()) if p.exists() else {"destinations": {}, "transport": "http"}
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"destinations": {}, "transport": "http"}
 
     def destination(self, alias):
         value = self.config()["destinations"].get(alias)

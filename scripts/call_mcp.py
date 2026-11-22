@@ -13,8 +13,8 @@ from mcp.client.stdio import stdio_client
 async def main():
     tool = sys.argv[1]
     value = sys.argv[2] if len(sys.argv) > 2 else "{}"
-    args = json.loads(Path(value[1:]).read_text() if value.startswith("@") else value)
-    async with stdio_client(StdioServerParameters(command=sys.executable, args=["-m", "mod_curator", "serve"], env=dict(os.environ))) as (r, w):
+    args = json.loads(Path(value[1:]).read_text(encoding="utf-8") if value.startswith("@") else value)
+    async with stdio_client(StdioServerParameters(command=sys.executable, args=["-X", "utf8", "-m", "mod_curator", "serve"], env=dict(os.environ))) as (r, w):
         async with ClientSession(r, w) as s:
             await s.initialize()
             result = await s.call_tool(tool, args)
@@ -24,4 +24,6 @@ async def main():
                 raise SystemExit(1)
 
 
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
 asyncio.run(main())

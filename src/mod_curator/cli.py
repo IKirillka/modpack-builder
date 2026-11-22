@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 from .engine import Engine
@@ -11,14 +12,18 @@ from .store import Store
 
 
 def main():
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="CurseForge catalogue curation and local MCP")
     sub = parser.add_subparsers(dest="action", required=True)
     init = sub.add_parser("init", help="Register a local destination. No model can register arbitrary folders.")
     init.add_argument("--destination", required=True)
     init.add_argument("--alias", default="mods")
-    init.add_argument("--transport", choices=["http", "browser", "cdp"], default="http")
-    init.add_argument("--cdp-url", default="http://127.0.0.1:9222")
-    init.add_argument("--headed", action="store_true")
+    init.add_argument("--transport", choices=["http", "browser", "cdp"])
+    init.add_argument("--cdp-url")
+    init.add_argument("--headed", action="store_true", default=None)
     serve = sub.add_parser("serve")
     serve.add_argument("--transport", choices=["stdio", "http"], default="stdio")
     serve.add_argument("--port", type=int, default=8765)
@@ -30,11 +35,36 @@ def main():
     status.add_argument("job_id")
     resume = sub.add_parser("resume")
     resume.add_argument("job_id")
+    resume.add_argument("--max-states", type=int)
     audit = sub.add_parser("verify", help="Audit saved catalogue pages or a specific Prism instance; never launch Minecraft")
     audit.add_argument("kind", choices=["collection", "prism"])
     audit.add_argument("job_id")
     audit.add_argument("--instance", type=Path)
     audit.add_argument("--log", type=Path)
+    preflight = sub.add_parser("preflight", help="Run the exact-revision installation check")
+    preflight.add_argument("job_id")
+    preflight.add_argument("--revision", type=int)
+    preflight.add_argument("--loader-version")
+    preflight.add_argument("--request")
+    preflight.add_argument("--max-states", type=int, default=100000)
+    preflight.add_argument("--jar-alias")
+    export = sub.add_parser("export", help="Export a selected revision for Prism")
+    export.add_argument("job_id")
+    export.add_argument("revision", type=int)
+    export.add_argument("--name", default="Modpack Builder pack")
+    sync = sub.add_parser("instance-update", help="Preview/apply/rollback a managed test instance update")
+    step = sync.add_subparsers(dest="step", required=True)
+    for name in ("register", "preview", "apply", "rollback"):
+        action = step.add_parser(name)
+        action.add_argument("instance", type=Path)
+        if name != "rollback":
+            action.add_argument("export_id")
+        if name in ("preview", "apply"):
+            action.add_argument("staged", type=Path)
+        if name == "rollback":
+            action.add_argument("backup", type=Path)
+        if name in ("apply", "rollback"):
+            action.add_argument("--confirm", required=True)
     extraction = sub.add_parser("extract", help="Schedule/inspect factual extraction; runs only with --run")
     extraction.add_argument("job_id")
     extraction.add_argument("--prepare", action="store_true")
@@ -127,17 +157,22 @@ def main():
             parser.error("Destination and service state must be separate directory trees")
         config = store.config()
         config["destinations"][args.alias] = str(path)
-        config.update(transport=args.transport, cdp_url=args.cdp_url, headless=not args.headed, browser_profile=str(store.root / "browser-profile"))
+        config['transport'] = args.transport or config.get('transport', 'http')
+        config['cdp_url'] = args.cdp_url or config.get('cdp_url', 'http://127.0.0.1:9222')
+        config.setdefault('headless', True)
+        if args.headed is not None:
+            config['headless'] = not args.headed
+        config.setdefault('browser_profile', str(store.root / 'browser-profile'))
         target = store.root / "config.json"
-        target.write_text(json.dumps(config, indent=2))
+        target.write_text(json.dumps(config, indent=2), encoding="utf-8")
         target.chmod(0o600)
         print(json.dumps(config, indent=2))
     elif args.action == "start":
-        print(json.dumps(Engine().start(json.loads(args.filters_json.read_text()))))
+        print(json.dumps(Engine().start(json.loads(args.filters_json.read_text(encoding="utf-8")))))
     elif args.action == "status":
         print(json.dumps(Engine().status(args.job_id), ensure_ascii=False, indent=2))
     elif args.action == "resume":
-        print(json.dumps(Engine().resume(args.job_id)))
+        print(json.dumps(Engine().resume(args.job_id, max_states=args.max_states)))
     elif args.action == "economy-worker":
         from .economy import Economy
         print(json.dumps(Economy(Store()).work(args.run_id), ensure_ascii=False))
@@ -176,6 +211,26 @@ def main():
             print(json.dumps(launch(store,args.job_id,args.batches,args.effort)))
         else:
             print(json.dumps(facts.progress(args.job_id)))
+    elif args.action == "preflight":
+        from .preflight import schedule
+        result = schedule(Engine(), args.job_id, args.revision, args.loader_version,
+                          user_request=args.request, max_states=args.max_states, jar_alias=args.jar_alias)
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.action == "export":
+        from .composition import Composition
+        result = Composition(Engine()).export_revision(args.job_id, args.revision, args.name)
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.action == "instance-update":
+        from . import instance_sync
+        if args.step == "rollback":
+            result = instance_sync.rollback(args.instance, args.backup, args.confirm)
+        elif args.step == "register":
+            result = instance_sync.register(Store(), args.export_id, args.instance)
+        elif args.step == "preview":
+            result = instance_sync.preview(Store(), args.export_id, args.instance, args.staged)
+        else:
+            result = instance_sync.apply(Store(), args.export_id, args.instance, args.staged, args.confirm)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.action == "verify":
         from .verification import audit_collection, audit_prism
         if args.kind == "prism" and args.instance is None:

@@ -15,6 +15,11 @@ browser-profile/
 !/evidence/mcp.schema.json
 /docs/*
 !/docs/INSTALL.md
+!/docs/WINDOWS.md
+!/docs/AUDIT_WINDOWS.md
+!/docs/P0_WINDOWS_TRIAL.md
+!/docs/P0_VALIDATION.md
+!/docs/BACKLOG_WINDOWS_AUDIT.md
 !/docs/JOB_CLEANUP.md
 !/docs/MCP.md
 *.log

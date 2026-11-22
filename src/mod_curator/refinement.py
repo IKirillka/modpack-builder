@@ -8,6 +8,7 @@ import json
 import math
 import re
 
+from . import captures
 from .brief import legacy_brief
 from .composition import pack_state
 from .models import Filters, SourceError
@@ -16,6 +17,8 @@ from .source import parse_catalog
 
 def lower_threshold(engine, job_id, minimum_downloads, revision):
     origin = engine.store.get(job_id)
+    if origin.get('search_scopes'):
+        raise ValueError('This job uses independent search scopes. Set the new threshold on the affected scope in a linked brief.')
     engine.idle(origin)
     if revision != origin['selection_revision']:
         raise ValueError('Stale selection revision')
@@ -26,7 +29,7 @@ def lower_threshold(engine, job_id, minimum_downloads, revision):
         raise ValueError('A finished catalogue with saved pages is required')
     directory = engine.store.job_dir(job_id)
     if [page['number'] for page in pages] != list(range(1, len(pages)+1)) or any(
-        not (directory / f'catalog-{page["number"]}.html').is_file() for page in pages
+        not captures.exists(directory / f'catalog-{page["number"]}.html') for page in pages
     ):
         raise ValueError('Saved HTML pages are missing or not contiguous. The old job is intact; start a fresh scan only if requested.')
     pack = pack_state(origin)
@@ -39,7 +42,7 @@ def lower_threshold(engine, job_id, minimum_downloads, revision):
     initial = {key: deepcopy(origin[key]) for key in (
         'projects', 'decisions', 'decision_basis', 'decision_history', 'external_projects', 'release_policy',
         'history', 'requirements_revision', 'selection_revision', 'recheck_ids', 'recheck_scope_unspecified',
-        'file_pins', 'relationships',
+        'file_pins', 'relationships', 'install_evidence', 'replacements',
     ) if key in origin}
     initial.update(brief=brief, composition=pack, selection=pack['main'], early_stop=origin['early_stop'],
                    extension={'source_job_id': job_id, 'source_revision': revision,
@@ -71,7 +74,7 @@ class ExtensionSource:
         if number > len(self.pages):
             return await self.source.page(filters, number)
         saved = self.pages[number - 1]
-        raw = (self.parent / f'catalog-{number}.html').read_text()
+        raw = captures.read(self.parent / f'catalog-{number}.html')
         parsed = parse_catalog(raw, saved['url'], filters, number)
         if ([card['id'] for card in parsed.cards] != saved['ids']
                 or [card['downloads'] for card in parsed.cards] != saved['downloads']
@@ -84,7 +87,7 @@ class ExtensionSource:
             # Maintain the exact observed counters of the archived prefix. Live
             # boundary validation establishes identity, not a frozen site snapshot.
             self.checked_boundary = True
-        (self.target / f'catalog-{number}.html').write_text(raw)
+        captures.write(self.target / f'catalog-{number}.html', raw)
         if hasattr(self.source, 'seed_projects'):
             self.source.seed_projects({card['id']: card for card in parsed.cards})
         return parsed
@@ -95,7 +98,7 @@ def changed_criteria(before, after):
     for key in ('concept','alternative_criteria','final_size','reserve'):
         if before.get(key) != after.get(key):
             result.add(key)
-    for section in ('preferences','hard_requirements'):
+    for section in ('preferences','hard_requirements','extras'):
         old, new = before.get(section) or {}, after.get(section) or {}
         result.update(f'{section}.{key}' for key in old.keys() | new.keys() if old.get(key) != new.get(key))
     return result
