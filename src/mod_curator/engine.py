@@ -115,7 +115,7 @@ class Engine:
         except ValueError:
             lock.release()
             return
-        source = source or CurseForge(self.store.config(), self.store.job_dir(job_id))
+        source = source or CurseForge(self.store.config(), self.store.job_dir(job_id), credential_root=self.store.root)
         try:
             job = self.store.get(job_id)
             if job.get('extension') and job['stage'] == 'collect':
@@ -516,9 +516,6 @@ class Engine:
                            "analysis": d["decisions"].get(str(i))} for i in d["selection"]]}
 
     def confirm(self, job_id, revision, selection_fingerprint, *, target="jars", pack_name="Curated Create Trial", loader_version=None):
-        if target == "jars" and os.name == "nt":
-            raise ValueError("Direct JAR download requires POSIX. Export a CurseForge ZIP and import it in Prism Launcher.")
-
         def confirm(d):
             self.idle(d)
             if revision != d["selection_revision"] or selection_fingerprint != fingerprint(d["selection"]):

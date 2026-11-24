@@ -24,6 +24,8 @@ def main():
     init.add_argument("--transport", choices=["http", "browser", "cdp"])
     init.add_argument("--cdp-url")
     init.add_argument("--headed", action="store_true", default=None)
+    curseforge_key = sub.add_parser("curseforge-key", help="Configure the local CurseForge API key")
+    curseforge_key.add_argument("operation", choices=["set", "status", "check", "unset"])
     serve = sub.add_parser("serve")
     serve.add_argument("--transport", choices=["stdio", "http"], default="stdio")
     serve.add_argument("--port", type=int, default=8765)
@@ -124,6 +126,15 @@ def main():
         if action == "configure":
             rule.add_argument("--preview-token", required=True)
     args = parser.parse_args()
+    if args.action == "curseforge-key":
+        from .models import SourceError
+        from .store import state_home
+        try:
+            result = asyncio.run(curseforge_key_command(args.operation, state_home()))
+        except (SourceError, OSError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, ensure_ascii=False))
+        return
     lifecycle_commands = {"delete", "trash", "restore", "pin", "cleanup"}
     if args.action in lifecycle_commands:
         try:
@@ -165,7 +176,8 @@ def main():
         config.setdefault('browser_profile', str(store.root / 'browser-profile'))
         target = store.root / "config.json"
         target.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        target.chmod(0o600)
+        if sys.platform != "win32":
+            target.chmod(0o600)
         print(json.dumps(config, indent=2))
     elif args.action == "start":
         print(json.dumps(Engine().start(json.loads(args.filters_json.read_text(encoding="utf-8")))))
@@ -265,3 +277,27 @@ def lifecycle_command(args, service):
     if args.cleanup_action == "preview":
         return service.preview_cleanup(patch if patch.model_fields_set else None)
     return service.configure(patch, args.preview_token)
+
+
+async def curseforge_key_command(operation, root):
+    from .credentials import key_status, prompt_key, remove_key, store_key
+    from .source import CurseForge
+
+    if operation == "status":
+        return key_status(root)
+    if operation == "unset":
+        removed = remove_key(root)
+        return {**key_status(root), "removed_from_keyring": removed}
+
+    source = CurseForge({}, credential_root=root)
+    try:
+        if operation == "set":
+            source.api_key = prompt_key()
+        await source.check_api_access()
+        if operation == "set":
+            store_key(root, source.api_key)
+        status = key_status(root)
+        return {**status, "minecraft_api": "verified",
+                "verified_source": "system_keyring" if operation == "set" else status["source"]}
+    finally:
+        await source.close()

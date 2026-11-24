@@ -6,6 +6,8 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import stat
 import re
 import secrets
 import shutil
@@ -131,8 +133,40 @@ def hash_value(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def linked(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def protected_artifact(path):
+    return path.suffix.lower() == ".zip" or path.name.lower() in ("instance.cfg", "mmc-pack.json")
+
+
+def remove_windows_tree(directory):
+    from .windows_files import pinned_directory
+
+    def remove_children(path):
+        with pinned_directory(path, parents=False):
+            for child in path.iterdir():
+                if linked(child) or protected_artifact(child):
+                    raise ValueError(f"Protected or redirected path in job directory: {child}")
+                if child.is_dir():
+                    remove_children(child)
+                else:
+                    child.unlink()
+        path.rmdir()
+
+    with pinned_directory(directory.parent):
+        remove_children(directory)
+
+
 def lock_busy(path):
-    if path.is_symlink() or path.parent.is_symlink():
+    if linked(path) or linked(path.parent):
         return True
     if not path.is_file():
         return False
@@ -225,7 +259,7 @@ class JobLifecycle:
                              if (rev := field(row, key, "revision")) is not None)
         directory = self.store.root / "jobs" / job_id
         reports = sorted(p.name for p in directory.iterdir() if p.suffix in (".json", ".csv", ".log")) if (
-            directory.is_dir() and not directory.is_symlink() and not directory.parent.is_symlink()
+            directory.is_dir() and not linked(directory) and not linked(directory.parent)
         ) else []
         return {"revisions": sorted(revisions), "installation_plan_counts_by_revision": plan_revisions,
                 "reports_directory": str(directory), "reports": reports[:30], "report_count": len(reports),
@@ -360,18 +394,24 @@ class JobLifecycle:
 
     def _purge_path(self, job_id, job=None):
         directory = self.store.root / "jobs" / checked_id(job_id)
-        if directory.parent.is_symlink() or directory.is_symlink():
+        if linked(directory.parent) or linked(directory):
             raise ValueError("Refusing to remove a linked job directory")
-        if directory.exists() and (not directory.is_dir() or not shutil.rmtree.avoids_symlink_attacks):
+        if directory.exists() and (not directory.is_dir() or
+                                   (os.name != "nt" and not shutil.rmtree.avoids_symlink_attacks)):
             raise ValueError("Safe recursive removal of this job directory is unavailable")
         current = job or {}
         protected = [field(current, "pack_export", "path")]
         protected.extend(self.store.config().get("destinations", {}).values())
         if any(Path(value).resolve().is_relative_to(directory) for value in protected if isinstance(value, str)):
             raise ValueError("Job directory contains an export or a registered destination")
-        if directory.exists() and any(p.suffix.lower() == ".zip" or p.name in ("instance.cfg", "mmc-pack.json")
-                                      for p in directory.rglob("*")):
-            raise ValueError("Job directory contains a ZIP or Prism instance. Permanent deletion blocked.")
+        if directory.exists():
+            pending = [directory]
+            while pending:
+                for path in pending.pop().iterdir():
+                    if protected_artifact(path) or linked(path):
+                        raise ValueError("Job directory contains a ZIP, Prism instance or redirected path. Permanent deletion blocked.")
+                    if path.is_dir():
+                        pending.append(path)
         return directory
 
     def _begin_purge(self, db, job_id, job):
@@ -381,7 +421,10 @@ class JobLifecycle:
     def _finish_purge(self, job_id):
         directory = self._purge_path(job_id)
         if directory.exists():
-            shutil.rmtree(directory)
+            if os.name == "nt":
+                remove_windows_tree(directory)
+            else:
+                shutil.rmtree(directory)
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             for table in ("economy_claims", "economy_projects"):

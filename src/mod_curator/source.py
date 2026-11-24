@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import re
 import time
 from dataclasses import dataclass
+from functools import cached_property
+from pathlib import Path
 from typing import Protocol
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -15,9 +16,13 @@ import httpx
 from bs4 import BeautifulSoup
 
 from . import __version__, captures
+from .credentials import effective_key, key_status
 from .models import Filters, LOADERS, SourceError
+from .store import state_home
 
 BASE = "https://www.curseforge.com"
+API_BASE = "https://api.curseforge.com"
+MINECRAFT_CHECK_PROJECT = 328085  # Create, a public Minecraft mod
 PROJECT_SLUG = re.compile(r"[a-z0-9_-]+")
 SORT = "total downloads"
 
@@ -192,10 +197,10 @@ def parse_catalog(html: str, final_url: str, filters: Filters, number: int) -> P
 
 
 class CurseForge:
-    def __init__(self, config: dict, evidence_dir=None):
+    def __init__(self, config: dict, evidence_dir=None, *, credential_root: Path | None = None):
         self.config = config
         self.client = httpx.AsyncClient(timeout=40, headers={"User-Agent": f"ModpackBuilder/{__version__} (+local user tool)"})
-        self.api_key = os.environ.get("CURSEFORGE_API_KEY")
+        self.credential_root = credential_root
         self.browser = None
         self.remote_browser = None
         self.playwright = None
@@ -205,6 +210,31 @@ class CurseForge:
         self.known_projects = {}
         self.file_cache = {}
         self.network_seconds = 0.0
+
+    @cached_property
+    def api_key(self):
+        return effective_key(self.credential_root or state_home())
+
+    @property
+    def metadata_provider(self):
+        status = key_status(self.credential_root or state_home())
+        return "curseforge_api" if status["configured"] else "curseforge_website"
+
+    async def check_api_access(self):
+        """Check this key can read Minecraft project and file metadata."""
+        if not self.api_key:
+            raise SourceError("API_KEY_REQUIRED: run curseforge-key set or set CURSEFORGE_API_KEY locally")
+        try:
+            project = await self.project(MINECRAFT_CHECK_PROJECT)
+            files = (await self.api(f"mods/{MINECRAFT_CHECK_PROJECT}/files", {"pageSize": 1}))["data"]
+            if not isinstance(files, list) or not files or files[0].get("modId") != project["id"]:
+                raise SourceError("API_MINECRAFT_FILES_UNVERIFIED")
+        except SourceError as exc:
+            if str(exc).startswith("SOURCE_HTTP_404:"):
+                raise SourceError("API_MINECRAFT_NOT_ACCESSIBLE: check that this key can read Minecraft projects and files") from None
+            raise
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise SourceError("API_RESPONSE_INVALID: unexpected Minecraft metadata") from None
 
     def seed_projects(self, projects):
         self.known_projects.update({int(k): v for k, v in projects.items()})
@@ -238,15 +268,24 @@ class CurseForge:
             self.network_seconds += time.monotonic() - started
 
     async def _request(self, url, *, api=False, params=None):
-        headers = {"x-api-key": self.api_key} if api and self.api_key else {}
-        if api and not self.api_key:
-            raise SourceError("API_KEY_REQUIRED: set CURSEFORGE_API_KEY locally; catalogue never uses API search")
+        headers = {}
+        if api:
+            target = urlparse(url)
+            if target.scheme != "https" or target.netloc != "api.curseforge.com" or not target.path.startswith("/v1/"):
+                raise SourceError("API_ENDPOINT_REFUSED: credentials are restricted to the official CurseForge API")
+            if not self.api_key:
+                raise SourceError("API_KEY_REQUIRED: run curseforge-key set or set CURSEFORGE_API_KEY locally")
+            headers = {"x-api-key": self.api_key, "Accept": "application/json"}
         last = None
         for attempt in range(3):
             try:
-                r = await self.client.get(url, headers=headers, params=params)
+                r = await self.client.get(url, headers=headers, params=params, follow_redirects=False)
+                if api and 300 <= r.status_code < 400:
+                    raise SourceError("API_REDIRECT_REFUSED: CurseForge API returned an unexpected redirect")
+                if api and r.status_code in (401, 403):
+                    raise SourceError(f"API_DENIED: HTTP {r.status_code}; check the key and Minecraft API permissions")
                 if r.status_code == 403:
-                    raise SourceError("SITE_BLOCKED: HTTP 403 from CurseForge" if not api else "API_DENIED: invalid key or permissions")
+                    raise SourceError("SITE_BLOCKED: HTTP 403 from CurseForge")
                 if r.status_code == 404:
                     raise SourceError(f"SOURCE_HTTP_404: {url}")
                 if r.status_code == 429 or r.status_code >= 500:
@@ -331,7 +370,7 @@ class CurseForge:
         raise last
 
     async def api(self, endpoint, params=None):
-        return (await self.request("https://api.curseforge.com/v1/" + endpoint, api=True, params=params)).json()
+        return (await self.request(API_BASE + "/v1/" + endpoint, api=True, params=params)).json()
 
     async def project(self, project_id):
         if not self.api_key:
@@ -344,7 +383,7 @@ class CurseForge:
         if p["id"] != project_id or p.get("gameId") != 432 or p.get("classId") != 6:
             raise SourceError("NOT_A_MINECRAFT_MOD")
         return dict(id=p["id"], name=p["name"], slug=p["slug"],
-                    url=f"{BASE}/minecraft/mc-mods/{p['slug']}", downloads=p["downloadCount"], provenance="user_added",
+                    url=f"{BASE}/minecraft/mc-mods/{p['slug']}", downloads=p["downloadCount"], provenance="user_added", metadata_source="curseforge_api",
                     allow_mod_distribution=p.get("allowModDistribution"))
 
     async def describe(self, project):
@@ -361,6 +400,7 @@ class CurseForge:
             if self.api_key:
                 raw = (await self.api(f"mods/{project['id']}/description"))["data"]
                 metadata = (await self.api(f"mods/{project['id']}"))["data"]
+                metadata["metadata_source"] = "curseforge_api"
             else:
                 html, _ = await self.html(project["url"])
                 if self.evidence_dir:
@@ -390,7 +430,7 @@ class CurseForge:
             batch, paging = obj["data"], obj["pagination"]
             if paging["index"] != index or paging["resultCount"] != len(batch):
                 raise SourceError("API_PAGINATION_INVALID")
-            files.extend(batch)
+            files.extend(self.api_file(file, project_id) for file in batch)
             index += len(batch)
             if index >= paging["totalCount"]:
                 return files
@@ -406,10 +446,16 @@ class CurseForge:
                 if str(exc).startswith("SOURCE_HTTP_404:"):
                     return None
                 raise
-            return file if file.get("id") == file_id else None
+            return self.api_file(file, project_id) if file.get("id") == file_id else None
         files = await self.website_files(project_id, filters, until_file=file_id)
         if files and files[0]["isAvailable"]:
             return await self.complete_file(files[0], fresh=True)
+
+    def api_file(self, file, project_id):
+        if file.get("modId") != project_id or type(file.get("id")) is not int or file["id"] <= 0:
+            raise SourceError("INVALID_FILE_IDENTITY: CurseForge API returned a different project or invalid file")
+        return {**file, "_metadata_source": "curseforge_api",
+                "_dependencies_source": f"{API_BASE}/v1/mods/{project_id}/files/{file['id']}"}
 
     def normalize_file(self, item, pid, slug):
         flavors = [f["name"] for f in item.get("flavors", [])]

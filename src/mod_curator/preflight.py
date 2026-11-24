@@ -162,7 +162,9 @@ async def build_plan(engine, task_id, source, options, f, projects, *, track_cur
         return plan
     if hasattr(source, 'seed_projects'):
         source.seed_projects(projects)
-    tracker = PreflightSource(engine, task_id, source, (options['job_id'], f"{options['revision']}:{task_id}:{plan['input_key']}"))
+    provider = getattr(source, "metadata_provider", "default")
+    scope = (options['job_id'], f"{options['revision']}:{task_id}:{plan['input_key']}:{provider}")
+    tracker = PreflightSource(engine, task_id, source, scope)
     try:
         rules = grouped(inputs.get('install_evidence', []))
         lock = await resolve(tracker, inputs['roots'], f, tracker.cancel,

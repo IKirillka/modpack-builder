@@ -1,5 +1,6 @@
 import hashlib
 import io
+import sys
 import zipfile
 
 import httpx
@@ -75,7 +76,12 @@ async def test_filename_symlink_and_redirect_escape(tmp_path, payload):
         f["fileName"] = "target.jar"
         outside = tmp_path.parent / "outside.jar"
         outside.write_bytes(b"private")
-        (tmp_path / "target.jar").symlink_to(outside)
+        try:
+            (tmp_path / "target.jar").symlink_to(outside)
+        except OSError as exc:
+            if sys.platform == "win32" and exc.winerror == 1314:
+                pytest.skip("Windows file symlinks require Developer Mode or permission")
+            raise
         with pytest.raises(OSError):
             await download_one(c, f, tmp_path)
         assert outside.read_bytes() == b"private"
@@ -92,3 +98,26 @@ async def test_manual_and_cancel(tmp_path, payload):
         with pytest.raises(Cancelled):
             await download_one(c, f, tmp_path, cancel)
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("name", ["CON.jar", "lpt².jar", "data?.jar", "bad:stream.jar", " file.jar"])
+async def test_windows_unsafe_filenames_rejected_on_all_platforms(tmp_path, payload, name):
+    f, _ = payload
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: pytest.fail("must reject before network"))) as client:
+        with pytest.raises(SourceError, match="UNSAFE_FILENAME"):
+            await download_one(client, {**f, "fileName": name}, tmp_path)
+
+
+async def test_file_appearing_during_download_is_not_replaced(tmp_path, payload):
+    f, data = payload
+    target = tmp_path / f["fileName"]
+
+    def response(_):
+        target.write_bytes(b"concurrent file")
+        return httpx.Response(200, content=data)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+        with pytest.raises(SourceError, match="DOWNLOAD_FAILED: FileExistsError"):
+            await download_one(client, f, tmp_path)
+    assert list(tmp_path.iterdir()) == [target]
+    assert target.read_bytes() == b"concurrent file"

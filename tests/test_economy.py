@@ -248,6 +248,7 @@ async def test_worker_does_not_accept_substituted_model(engine, filters, monkeyp
         def wait(self, timeout):
             return 0
 
+    monkeypatch.setattr('mod_curator.extraction_worker.codex_command', lambda: ['fixture-codex'])
     monkeypatch.setattr('mod_curator.extraction_worker.subprocess.Popen', SimulatedCodex)
     monkeypatch.setattr('mod_curator.extraction_worker.observe_session', lambda _: {'model':'gpt-6-luna','reasoning_effort':'low'})
     with pytest.raises(RuntimeError, match='MODEL_NOT_VERIFIED'):

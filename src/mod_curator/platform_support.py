@@ -32,7 +32,8 @@ def prism_executable():
         return str(candidate.resolve())
     binary = shutil.which("prismlauncher.exe" if os.name == "nt" else "prismlauncher")
     if binary is None and os.name == "nt":
-        return windows_program("PrismLauncher/prismlauncher.exe", "Programs/PrismLauncher/prismlauncher.exe")
+        return windows_program("PrismLauncher/prismlauncher.exe", "Programs/PrismLauncher/prismlauncher.exe",
+                               "Programs/Prism Launcher/prismlauncher.exe")
     return binary
 
 

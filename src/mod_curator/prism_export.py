@@ -106,9 +106,20 @@ def build_manifest(lock, filters, loader, name, version="1.0.0", *, has_verified
 
 
 def write_pack(manifest, destination: Path, basename, overrides=None):
+    if os.name == "nt":
+        from .windows_files import pinned_directory
+        with pinned_directory(destination):
+            return _write_pack(manifest, destination, basename, overrides)
+    return _write_pack(manifest, destination, basename, overrides)
+
+
+def _write_pack(manifest, destination, basename, overrides):
+    from .lifecycle import linked
     from .modrinth import safe_jar_name
     overrides = overrides or {}
     resources = {f'overrides/mods/{safe_jar_name(name)}': path for name, path in overrides.items()}
+    if len({name.casefold() for name in resources}) != len(resources):
+        raise ValueError("Override filenames collide on a case-insensitive filesystem")
     expected_files = {"manifest.json", "overrides/", *resources}
 
     def digest(path):
@@ -120,7 +131,7 @@ def write_pack(manifest, destination: Path, basename, overrides=None):
     final = destination / basename
     raw = json.dumps(manifest, ensure_ascii=False, indent=2).encode()
     def reuse():
-        if final.is_symlink():
+        if linked(final):
             raise SourceError("EXPORT_EXISTS: symlink target refused")
         if not final.is_file():
             raise SourceError("EXPORT_EXISTS: expected a regular ZIP file")
@@ -143,7 +154,7 @@ def write_pack(manifest, destination: Path, basename, overrides=None):
             raise SourceError("EXPORT_EXISTS: invalid ZIP; never overwrite") from exc
         return {"path": str(final), "sha256": digest(final), "reused": True}
 
-    if final.exists() or final.is_symlink():
+    if final.exists() or linked(final):
         return reuse()
     part = destination / (".curator-export-" + uuid.uuid4().hex + ".part")
     try:

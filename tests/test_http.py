@@ -31,7 +31,7 @@ async def test_streamable_http_protocol(engine):
             async with ClientSession(r, w) as s:
                 await s.initialize()
                 result = await s.call_tool("capabilities", {})
-                assert result.structuredContent["local_downloads"] == "POSIX only (supplemental)"
+                assert result.structuredContent["local_downloads"] == "Windows and POSIX (supplemental)"
                 assert len((await s.list_tools()).tools) == 43
     finally:
         proc.terminate()

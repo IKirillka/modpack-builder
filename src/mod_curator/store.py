@@ -12,7 +12,7 @@ from .lifecycle import checked_id, record_open, references, require_available
 
 
 def state_home() -> Path:
-    return Path(os.environ.get("MOD_CURATOR_HOME", Path.home() / ".local/share/mod-curator")).expanduser().resolve()
+    return Path(os.environ.get("MOD_CURATOR_HOME") or Path.home() / ".local/share/mod-curator").expanduser().resolve()
 
 
 class Store:

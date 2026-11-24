@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Install the runtime and prepare a Windows-compatible local marketplace."""
 import json
+import argparse
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
-import venv
 
 from runtime_paths import runtime_dir, runtime_python, state_dir
 
@@ -35,14 +35,23 @@ def prepare_marketplace(source, marketplace, python, custom_state=None):
 def main():
     if sys.version_info < (3, 11):
         raise SystemExit("Modpack Builder requires Python 3.11 or newer.")
+    parser = argparse.ArgumentParser(description="Install or update Modpack Builder for the current user.")
+    parser.add_argument("--with-chromium", action="store_true",
+                        help="Install Playwright Chromium for the optional browser transport")
+    options = parser.parse_args()
     source = Path(__file__).resolve().parents[1]
     runtime = runtime_dir()
     python = runtime_python(runtime, os.name == "nt")
-    venv.EnvBuilder(with_pip=True).create(runtime)
+    # Updating an existing venv does not require rewriting python.exe.
+    if not python.is_file():
+        import venv
+        venv.EnvBuilder(with_pip=True).create(runtime)
     import tomllib
     version = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     wheel = source / "vendor" / f"minecraft_mod_curator-{version}-py3-none-any.whl"
     subprocess.run([str(python), "-X", "utf8", "-m", "pip", "install", str(wheel if wheel.is_file() else source)], check=True)
+    if options.with_chromium:
+        subprocess.run([str(python), "-X", "utf8", "-m", "playwright", "install", "chromium"], check=True)
     if os.environ.get("MOD_CURATOR_SKIP_AGENTS") != "1":
         subprocess.run([sys.executable, "-X", "utf8", str(source / "scripts/install_agents.py")], check=True)
     if os.name == "nt":

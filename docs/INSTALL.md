@@ -4,7 +4,7 @@
 
 ## 1. Получите файлы
 
-Скачайте `minecraft-mod-curator-0.8.1-plugin.zip` со страницы [выпуска 0.8.1](https://github.com/IKirillka/modpack-builder/releases/tag/v0.8.1). Распакуйте его и откройте терминал в папке `minecraft-mod-curator`. Для установки из исходников клонируйте репозиторий.
+Возьмите собранный `minecraft-mod-curator-<версия>-plugin.zip` или скачайте его со [страницы выпусков](https://github.com/IKirillka/modpack-builder/releases). Распакуйте его и откройте терминал в папке `minecraft-mod-curator`. Для установки из исходников клонируйте репозиторий.
 
 ```bash
 git clone https://github.com/IKirillka/modpack-builder.git
@@ -60,6 +60,19 @@ python3 scripts/launch.py --help
 python3 scripts/launch.py cleanup settings
 ```
 
-Ключ CurseForge API необязателен для работы через браузер. Если нужен официальный API, передайте `CURSEFORGE_API_KEY` в окружение локального сервера. Храните ключ вне репозитория.
+## Ключ CurseForge API
+
+В версии 0.8.2 и новее для настройки откройте [раздел API Keys](https://console.curseforge.com/#/api-keys) и скопируйте ключ, которому разрешено чтение метаданных Minecraft. В папке установленного или распакованного плагина выполните:
+
+```bash
+python3 scripts/launch.py curseforge-key set
+python3 scripts/launch.py curseforge-key status
+```
+
+На Windows используйте `py -3 .\scripts\launch.py curseforge-key set`. Вставьте ключ в скрытое поле в терминале. Команда проверит доступ к проекту Minecraft и его файлам, затем сохранит ключ в системном хранилище. Через MCP видны только наличие и источник настройки. Для работы с новыми заданиями достаточно перезапустить установленный MCP, если он ещё запущен на старой версии.
+
+`curseforge-key check` повторно проверяет доступ, а `curseforge-key unset` удаляет локальную запись из системного хранилища. Значение `CURSEFORGE_API_KEY` в окружении MCP имеет приоритет. Оно подходит для сервера без доступного хранилища учётных данных и удаляется отдельно из окружения. Ошибка 401 или 403 на этапе проверки может означать, что ключ не имеет доступа к Minecraft. [Документация CurseForge REST API](https://docs.curseforge.com/rest-api/#authentication)
+
+Официальный API используется для описаний, файлов и объявленных связей найденных проектов. Сам обход каталога CurseForge с фильтрами и сортировкой продолжает читать реальные страницы сайта. Доступ через браузер может потребоваться даже с настроенным ключом.
 
 ZIP и локальная конфигурация рассчитаны на клиент с доступом к вашему компьютеру. Для ChatGPT Web нужен отдельно настроенный путь подключения удалённого MCP. Такой сценарий для этого пакета не проверен. [Документация OpenAI по локальным и удалённым MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).

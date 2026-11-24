@@ -7,6 +7,7 @@ from . import DISPLAY_NAME, __version__
 from .brief import BriefPatch, Intake
 from .composition import Composition, PackChange, Relationship
 from .engine import Engine
+from .credentials import key_status
 from .economy import Economy, SettingsPatch
 from .lifecycle import CleanupPatch, JobLifecycle, run_on_startup
 from .models import Decision, Filters
@@ -28,9 +29,10 @@ def make_server(engine=None, port=8765):
     @mcp.tool(annotations=read)
     def capabilities() -> dict[str, Any]:
         """Use first: list configured local destinations and source/client limitations. No arbitrary paths accepted."""
+        credential = key_status(e.store.root)
         return {"version": __version__, "display_name": DISPLAY_NAME, "analysis_workflow": "Configurable isolated workers extract facts -> current chat agent selects; no automatic bulk reanalysis", "source": "CurseForge website catalogue, descriptions and exact file/dependency pages; official API optional",
-                "destinations": e.store.config()["destinations"], "api_key_configured": bool(__import__("os").environ.get("CURSEFORGE_API_KEY")),
-                "transport": e.store.config().get("transport", "http"), "local_downloads": "POSIX only (supplemental)",
+                "destinations": e.store.config()["destinations"], "api_key_configured": credential["configured"], "api_key_source": credential["source"],
+                "transport": e.store.config().get("transport", "http"), "local_downloads": "Windows and POSIX (supplemental)",
                 "primary_workflow": "confirm_and_export -> CurseForge ZIP -> Prism Launcher",
                 "metadata_without_api_key": "Implemented from exact website file/dependencies pages; site access is still required",
                 "constraint_coverage": "game/loader, required project relations, then read-only JAR mandatory version validation",

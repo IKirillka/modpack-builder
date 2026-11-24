@@ -31,7 +31,7 @@ shutil.copy2(wheel, root / "vendor" / wheel.name)
 archive = root / f"dist/minecraft-mod-curator-{version}-plugin.zip"
 # An allowlist keeps local captures, state and historical reports out of releases.
 include_files = (
-    "plugin.json", "mcp.json", ".mcp.json", "pyproject.toml", "README.md", "LICENSE",
+    "plugin.json", "mcp.json", ".mcp.json", "pyproject.toml", "README.md", "LICENSE", "install.cmd",
     ".gitignore", "requirements.lock.txt", ".agents/plugins/marketplace.json",
     ".codex-plugin/plugin.json", "skills/curate-minecraft-mods/SKILL.md",
     "docs/INSTALL.md", "docs/WINDOWS.md", "docs/AUDIT_WINDOWS.md", "docs/P0_WINDOWS_TRIAL.md",

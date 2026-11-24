@@ -25,12 +25,16 @@ plugin = trial / "minecraft-mod-curator"
 env = {**os.environ, "MOD_CURATOR_HOME": str(trial / "state"), "MOD_CURATOR_SKIP_AGENTS": "1",
        "MOD_CURATOR_RUNTIME": str(trial / "state/runtime")}
 begin = time.monotonic()
-with (trial / "install.log").open("w") as log:
-    subprocess.run([sys.executable, "-X", "utf8", str(plugin / "scripts/install.py")], env=env, stdout=log, stderr=log, check=True)
+installer = [sys.executable, "-X", "utf8", str(plugin / "scripts/install.py")]
+if sys.platform == "win32":
+    installer = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "install.cmd"]
+with (trial / "install.log").open("w", encoding="utf-8") as log:
+    subprocess.run(installer, cwd=plugin, env=env, stdout=log, stderr=log, check=True)
 subprocess.run([sys.executable, str(plugin / "scripts/launch.py"), "init", "--destination", str(trial / "mods"), "--alias", "smoke"],
                env=env, stdout=subprocess.DEVNULL, check=True)
 install_seconds = time.monotonic() - begin
 command, args, settings = sys.executable, [str(plugin / "scripts/launch.py"), "serve"], env
+runtime = trial / "state/runtime" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
 if sys.platform == "win32":
     market_mcp = trial / "state/windows-marketplace/.mcp.json"
     server = json.loads(market_mcp.read_text(encoding="utf-8"))["mcpServers"]["minecraft_mod_curator"]
@@ -46,6 +50,7 @@ async def check():
             assert cap["destinations"]["smoke"] == str(trial / "mods")
             assert cap["version"] == version
             assert cap["display_name"] == init.serverInfo.name == "Modpack Builder"
+            assert "Windows" in cap["local_downloads"]
             assert {"pack_review", "pack_plan_sources", "verify_prism_export", "pack_check", "pack_check_result", "preview_delete_job", "restore_job", "preview_cleanup"} <= {t.name for t in tools.tools}
             draft = (await s.call_tool("pack_brief", {"action": "save", "patch": {
                 "concept": "Create factory", "filters": {"minecraft": "1.21.1", "loader": "NeoForge",
@@ -62,8 +67,26 @@ async def check():
                 }})).structuredContent
             assert ready["ready"] and not ready["next_questions"] and ready["effective_filters"]["release_types"] == [1, 2]
             assert not (await s.call_tool("list_jobs", {})).structuredContent["result"]
+            # Start an isolated, already-cancelled fixture. The installed CLI worker
+            # must outlive the launcher that created it and see the same SQLite job.
+            fixture = ("from mod_curator.engine import Engine; engine = Engine(); "
+                       f"job = engine.store.create({ready['effective_filters']!r}, cancel_requested=True); "
+                       "print(engine.launch(job)['job_id'])")
+            result = await asyncio.to_thread(subprocess.check_output, [str(runtime), "-X", "utf8", "-c", fixture],
+                                             env=env, text=True, encoding="utf-8", timeout=20)
+            job_id = result.strip()
+            deadline = time.monotonic() + 20
+            while True:
+                status = (await s.call_tool("job_status", {"job_id": job_id})).structuredContent
+                if status["status"] == "cancelled" and not status["worker_active"]:
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError(f"Detached worker did not finish: {status}")
+                await asyncio.sleep(0.5)
+            assert (trial / "state/jobs" / job_id / "report.json").is_file()
             assert (plugin / "skills/curate-minecraft-mods/SKILL.md").exists()
-            return {"protocol": init.protocolVersion, "tools": len(tools.tools), "capabilities": cap, "intake": "passed"}
+            return {"protocol": init.protocolVersion, "tools": len(tools.tools), "capabilities": cap,
+                    "intake": "passed", "detached_worker": "passed"}
 
 
 report = {"client_date": date.today().isoformat(), "method": "Actual ZIP relocation, fresh venv wheel install, standard MCP client",

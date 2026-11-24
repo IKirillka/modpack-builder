@@ -28,3 +28,6 @@ browser-profile/
 .env.*
 
 /.codex/config.toml
+
+# Non-secret marker for the system keychain entry.
+.curseforge-keyring

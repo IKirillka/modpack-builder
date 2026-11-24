@@ -1,6 +1,6 @@
 {
   "name": "minecraft-mod-curator",
-  "version": "0.8.1",
+  "version": "0.8.3",
   "description": "Persistent CurseForge curation and complete file/dependency manifests for Prism Launcher",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",

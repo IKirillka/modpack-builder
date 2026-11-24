@@ -240,7 +240,7 @@ class Composition:
         found, errors = {}, []
         if unknown:
             from .source import CurseForge
-            source = CurseForge(self.store.config(), self.store.job_dir(job_id))
+            source = CurseForge(self.store.config(), self.store.job_dir(job_id), credential_root=self.store.root)
             try:
                 for pid in dict.fromkeys(unknown):
                     try:
@@ -537,6 +537,7 @@ def wishes_changed(before, after):
 def open_prism_import(store, export_job_id):
     """Open Prism's new-instance import for a recorded, intact export only."""
     import hashlib
+    import os
     import shutil
     import subprocess
     from pathlib import Path
@@ -546,7 +547,8 @@ def open_prism_import(store, export_job_id):
     if job['status'] != 'exported' or not export.get('ready'):
         raise ValueError('A completed Prism ZIP export is required')
     archive = Path(export['path'])
-    if not archive.is_file() or archive.is_symlink():
+    from .verification import regular
+    if not regular(archive):
         raise ValueError('The recorded archive is missing or no longer a regular file')
     with archive.open('rb') as stream:
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -557,7 +559,7 @@ def open_prism_import(store, export_job_id):
     binary = prism_executable()
     if binary:
         command = [binary]
-    elif shutil.which('flatpak') and subprocess.run(
+    elif os.name != 'nt' and shutil.which('flatpak') and subprocess.run(
         ['flatpak', 'info', 'org.prismlauncher.PrismLauncher'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
     ).returncode == 0:

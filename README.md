@@ -4,7 +4,7 @@
 
 ## Установка
 
-[Скачайте ZIP из выпуска 0.8.1](https://github.com/IKirillka/modpack-builder/releases/tag/v0.8.1) и распакуйте его или клонируйте репозиторий. Полная инструкция включает установку локального компонента, подключение Codex, браузер для CurseForge и первый запуск. [Инструкция по установке](docs/INSTALL.md)
+[Скачайте ZIP со страницы выпусков](https://github.com/IKirillka/modpack-builder/releases) и распакуйте его или клонируйте репозиторий. Полная инструкция включает установку локального компонента, подключение Codex, браузер для CurseForge и первый запуск. [Инструкция по установке](docs/INSTALL.md)
 
 [Установка на Windows](docs/WINDOWS.md) · [Результаты аудита Windows](docs/AUDIT_WINDOWS.md) · [Проверка точного плана и импорта](docs/P0_WINDOWS_TRIAL.md)
 
@@ -25,6 +25,8 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q
 .venv/bin/python scripts/build_package.py
 ```
+
+На Windows используйте [команды для PowerShell](docs/WINDOWS.md#автоматическая-проверка-пакета).
 
 ZIP и контрольные суммы появятся в `dist/`. Пакет содержит исходники, инструкции и wheel. Python-зависимости загружаются при установке. Локальные данные и отчёты в пакет не входят.
 

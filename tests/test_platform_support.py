@@ -56,3 +56,33 @@ def test_platform_process_options_and_portable_prism(tmp_path, monkeypatch):
         assert background_options()["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         assert background_options() == {"start_new_session": True}
+
+
+def test_browser_detects_edge_without_path_and_checks_cdp(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    import start_browser
+
+    edge = tmp_path / "Microsoft/Edge/Application/msedge.exe"
+    edge.parent.mkdir(parents=True)
+    edge.touch()
+    if sys.platform == "win32":
+        monkeypatch.setattr(start_browser.shutil, "which", lambda name: None)
+        monkeypatch.setenv("ProgramFiles", str(tmp_path))
+        assert Path(start_browser.chrome_executable()) == edge
+
+    class CDPHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200 if self.path == "/json/version" else 404)
+            self.end_headers()
+            self.wfile.write(b'{"webSocketDebuggerUrl":"ws://127.0.0.1/devtools/browser/fixture"}')
+
+    with HTTPServer(("127.0.0.1", 0), CDPHandler) as server:
+        thread = Thread(target=server.handle_request)
+        thread.start()
+        try:
+            assert start_browser.cdp_ready(server.server_port)
+        finally:
+            thread.join(timeout=2)
